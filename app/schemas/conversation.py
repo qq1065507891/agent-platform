@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ConversationBase(BaseModel):
@@ -20,5 +20,7 @@ class MessageCreate(BaseModel):
 
 
 class ConversationOut(ConversationBase):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     created_at: datetime | None = None

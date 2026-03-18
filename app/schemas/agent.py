@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class AgentBase(BaseModel):
@@ -35,6 +35,14 @@ class AgentUpdate(BaseModel):
     status: str | None = Field(None, pattern=r"^(draft|published|archived)$")
 
 
-class AgentOut(AgentBase):
+class AgentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
+    name: str
+    description: str | None = None
+    prompt_template: str
+    skills: list[dict] | None = None
+    is_public: bool = False
+    status: str
     owner_id: str | None = None

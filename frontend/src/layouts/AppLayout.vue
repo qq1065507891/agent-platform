@@ -1,0 +1,95 @@
+<script setup lang="ts">
+import { computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { useAuthStore } from '../stores/auth'
+
+const route = useRoute()
+const router = useRouter()
+const authStore = useAuthStore()
+
+const selectedKey = computed(() => {
+  if (route.path.startsWith('/chat')) return 'chat'
+  if (route.path.startsWith('/agents')) return 'agents'
+  return 'agents'
+})
+
+const onMenuClick = (key: string) => {
+  if (key === 'agents') {
+    router.push('/agents')
+  }
+  if (key === 'chat') {
+    router.push('/chat/placeholder')
+  }
+}
+
+const onLogout = () => {
+  authStore.clearAuth()
+  router.push('/login')
+}
+</script>
+
+<template>
+  <a-layout class="app-layout">
+    <a-layout-header class="app-header">
+      <div class="logo">Agent 平台</div>
+      <div class="header-actions">
+        <span class="user-name">{{ authStore.user?.username ?? '未登录' }}</span>
+        <a-button type="primary" status="warning" size="small" @click="onLogout">登出</a-button>
+      </div>
+    </a-layout-header>
+
+    <a-layout>
+      <a-layout-sider class="app-sider" :width="220">
+        <a-menu :selected-keys="[selectedKey]" @menu-item-click="onMenuClick">
+          <a-menu-item key="agents">智能体市场</a-menu-item>
+          <a-menu-item key="chat">我的会话</a-menu-item>
+        </a-menu>
+      </a-layout-sider>
+
+      <a-layout-content class="app-content">
+        <router-view />
+      </a-layout-content>
+    </a-layout>
+  </a-layout>
+</template>
+
+<style scoped>
+.app-layout {
+  min-height: 100vh;
+  background: #f5f6f8;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  background: #1f2937;
+  color: #fff;
+}
+
+.logo {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.user-name {
+  font-size: 14px;
+}
+
+.app-sider {
+  background: #fff;
+  border-right: 1px solid #e5e6eb;
+}
+
+.app-content {
+  padding: 24px;
+  min-height: calc(100vh - 64px);
+}
+</style>
