@@ -24,3 +24,5 @@ class ConversationOut(ConversationBase):
 
     id: str
     created_at: datetime | None = None
+    agent_name: str | None = None
+    agent_description: str | None = None

@@ -5,10 +5,10 @@ from datetime import datetime
 from sqlalchemy import DateTime, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import BaseModel, JSONType, UUIDPrimaryKeyMixin
+from app.models.base import BaseModel, JSONType, TimestampMixin, UUIDPrimaryKeyMixin
 
 
-class Skill(BaseModel, UUIDPrimaryKeyMixin):
+class Skill(BaseModel, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "skills"
 
     skill_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)

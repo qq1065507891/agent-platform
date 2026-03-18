@@ -11,6 +11,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.api import agents as agents_router
 from app.api import auth as auth_router
 from app.api import conversations as conversations_router
+from app.api import skills as skills_router
 from app.api import users as users_router
 from app.schemas.common import ErrorDetail, ErrorResponse
 
@@ -24,6 +25,7 @@ app.include_router(auth_router.router, prefix="/api/v1")
 app.include_router(users_router.router, prefix="/api/v1")
 app.include_router(agents_router.router, prefix="/api/v1")
 app.include_router(conversations_router.router, prefix="/api/v1")
+app.include_router(skills_router.router, prefix="/api/v1")
 
 
 @app.get("/")

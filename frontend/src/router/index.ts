@@ -18,7 +18,9 @@ const routes: RouteRecordRaw[] = [
     children: [
       { path: '', redirect: '/agents' },
       { path: 'agents', name: 'agents', component: AgentsView },
+      { path: 'my-agents', name: 'my-agents', component: () => import('../views/MyAgentsView.vue') },
       { path: 'chat/:id', name: 'chat', component: ChatView },
+      { path: 'agent-chat/:agentId', name: 'agent-chat', component: () => import('../views/AgentChatView.vue') },
     ],
   },
   { path: '/:pathMatch(.*)*', redirect: '/agents' },

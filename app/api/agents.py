@@ -19,11 +19,13 @@ def list_agents(
     page_size: int = Query(20, ge=1, le=100),
     keyword: str | None = Query(None, min_length=1, max_length=64),
     is_public: bool | None = None,
+    mine: bool | None = Query(None, description="仅查询当前用户创建的智能体"),
     current_user: UserOut = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> APIResponse:
     service = AgentService(db)
-    agents, total = service.list_agents(page, page_size, keyword, is_public, None)
+    user_id = current_user.id if mine else None
+    agents, total = service.list_agents(page, page_size, keyword, is_public, user_id)
     data = Pagination(
         list=[AgentOut.model_validate(agent) for agent in agents],
         total=total,

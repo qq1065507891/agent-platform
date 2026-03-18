@@ -9,6 +9,7 @@ const authStore = useAuthStore()
 
 const selectedKey = computed(() => {
   if (route.path.startsWith('/chat')) return 'chat'
+  if (route.path.startsWith('/my-agents')) return 'my-agents'
   if (route.path.startsWith('/agents')) return 'agents'
   return 'agents'
 })
@@ -16,6 +17,9 @@ const selectedKey = computed(() => {
 const onMenuClick = (key: string) => {
   if (key === 'agents') {
     router.push('/agents')
+  }
+  if (key === 'my-agents') {
+    router.push('/my-agents')
   }
   if (key === 'chat') {
     router.push('/chat/placeholder')
@@ -42,6 +46,7 @@ const onLogout = () => {
       <a-layout-sider class="app-sider" :width="220">
         <a-menu :selected-keys="[selectedKey]" @menu-item-click="onMenuClick">
           <a-menu-item key="agents">智能体市场</a-menu-item>
+          <a-menu-item key="my-agents">我的智能体</a-menu-item>
           <a-menu-item key="chat">我的会话</a-menu-item>
         </a-menu>
       </a-layout-sider>

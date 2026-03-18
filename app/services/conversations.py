@@ -14,6 +14,7 @@ from app.services.agent.graph import (
     extract_assistant_message,
     to_langchain_messages,
 )
+from langchain_core.messages import SystemMessage
 
 
 class ConversationService:
@@ -37,11 +38,23 @@ class ConversationService:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self.db.query(Conversation).filter(Conversation.id == conversation_id).first()
 
+    def list_user_conversations(self, user_id: str, agent_id: str | None = None) -> list[Conversation]:
+        query = self.db.query(Conversation).filter(Conversation.user_id == user_id)
+        if agent_id:
+            query = query.filter(Conversation.agent_id == agent_id)
+        items = query.order_by(Conversation.created_at.desc()).all()
+        return [item for item in items if item.messages]
+
     def add_message(self, conversation: Conversation, payload: MessageCreate) -> dict[str, str]:
         trace_id = f"t-{uuid4().hex[:12]}"
         history = conversation.messages or []
 
         langchain_messages = to_langchain_messages(history)
+        if not history:
+            agent = self.db.query(Agent).filter(Agent.id == conversation.agent_id).first()
+            prompt_template = (agent.prompt_template or "").strip() if agent else ""
+            if prompt_template:
+                langchain_messages = [SystemMessage(content=prompt_template), *langchain_messages]
         langchain_messages = ensure_user_message(langchain_messages, payload.content)
 
         graph = build_agent_graph()

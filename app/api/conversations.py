@@ -27,6 +27,27 @@ def create_conversation(
     return success_response(ConversationOut.model_validate(conversation).model_dump())
 
 
+@router.get("")
+def list_conversations(
+    agent_id: str | None = None,
+    current_user: UserOut = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> APIResponse:
+    service = ConversationService(db)
+    conversations = service.list_user_conversations(current_user.id, agent_id)
+    data = [
+        ConversationOut.model_validate(
+            {
+                **item.__dict__,
+                "agent_name": item.agent.name if item.agent else None,
+                "agent_description": item.agent.description if item.agent else None,
+            }
+        ).model_dump()
+        for item in conversations
+    ]
+    return success_response(data)
+
+
 @router.get("/{conversation_id}", response_model=APIResponse)
 def get_conversation(
     conversation_id: str,
