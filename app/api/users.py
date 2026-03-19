@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_user, get_db
+from app.core.deps import get_db, require_admin
 from app.core.responses import success_response
 from app.schemas.common import APIResponse, Pagination
 from app.schemas.user import UserCreate, UserOut, UserUpdate
@@ -17,11 +17,9 @@ def list_users(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     keyword: str | None = Query(None, min_length=1, max_length=64),
-    current_user: UserOut = Depends(get_current_user),
+    _: UserOut = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> APIResponse:
-    if current_user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限")
     service = UserService(db)
     users, total = service.list_users(page, page_size, keyword)
     data = Pagination(
@@ -36,11 +34,9 @@ def list_users(
 @router.post("", response_model=APIResponse)
 def create_user(
     payload: UserCreate,
-    current_user: UserOut = Depends(get_current_user),
+    _: UserOut = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> APIResponse:
-    if current_user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限")
     service = UserService(db)
     try:
         user = service.create_user(payload)
@@ -53,11 +49,9 @@ def create_user(
 def update_user(
     user_id: str,
     payload: UserUpdate,
-    current_user: UserOut = Depends(get_current_user),
+    _: UserOut = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> APIResponse:
-    if current_user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限")
     service = UserService(db)
     try:
         user = service.update_user(user_id, payload)
@@ -71,11 +65,9 @@ def update_user(
 @router.post("/import", response_model=APIResponse)
 def import_users(
     payload: dict,
-    current_user: UserOut = Depends(get_current_user),
+    _: UserOut = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> APIResponse:
-    if current_user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限")
     users_payload = payload.get("users", [])
     service = UserService(db)
     success, failed = service.import_users([UserCreate.model_validate(item) for item in users_payload])

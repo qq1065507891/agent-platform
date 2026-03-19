@@ -8,6 +8,8 @@ const router = useRouter()
 const authStore = useAuthStore()
 
 const selectedKey = computed(() => {
+  if (route.path.startsWith('/admin/users')) return 'admin-users'
+  if (route.path.startsWith('/admin/roles')) return 'admin-roles'
   if (route.path.startsWith('/chat')) return 'chat'
   if (route.path.startsWith('/my-agents')) return 'my-agents'
   if (route.path.startsWith('/agents')) return 'agents'
@@ -23,6 +25,12 @@ const onMenuClick = (key: string) => {
   }
   if (key === 'chat') {
     router.push('/chat/placeholder')
+  }
+  if (key === 'admin-users') {
+    router.push('/admin/users')
+  }
+  if (key === 'admin-roles') {
+    router.push('/admin/roles')
   }
 }
 
@@ -48,6 +56,11 @@ const onLogout = () => {
           <a-menu-item key="agents">智能体市场</a-menu-item>
           <a-menu-item key="my-agents">我的智能体</a-menu-item>
           <a-menu-item key="chat">我的会话</a-menu-item>
+          <a-sub-menu v-if="authStore.user?.role === 'admin'" key="admin">
+            <template #title>系统管理</template>
+            <a-menu-item key="admin-users">用户管理</a-menu-item>
+            <a-menu-item key="admin-roles">角色管理</a-menu-item>
+          </a-sub-menu>
         </a-menu>
       </a-layout-sider>
 

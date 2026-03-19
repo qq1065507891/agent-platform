@@ -21,6 +21,18 @@ const routes: RouteRecordRaw[] = [
       { path: 'my-agents', name: 'my-agents', component: () => import('../views/MyAgentsView.vue') },
       { path: 'chat/:id', name: 'chat', component: ChatView },
       { path: 'agent-chat/:agentId', name: 'agent-chat', component: () => import('../views/AgentChatView.vue') },
+      {
+        path: 'admin/users',
+        name: 'admin-users',
+        component: () => import('../views/AdminUsersView.vue'),
+        meta: { requireAdmin: true },
+      },
+      {
+        path: 'admin/roles',
+        name: 'admin-roles',
+        component: () => import('../views/AdminRolesView.vue'),
+        meta: { requireAdmin: true },
+      },
     ],
   },
   { path: '/:pathMatch(.*)*', redirect: '/agents' },
@@ -40,6 +52,14 @@ router.beforeEach((to, _from, next) => {
   if (!token) {
     next('/login')
     return
+  }
+  if (to.meta.requireAdmin) {
+    const raw = localStorage.getItem('user')
+    const user = raw ? JSON.parse(raw) : null
+    if (!user || user.role !== 'admin') {
+      next('/agents')
+      return
+    }
   }
   next()
 })
