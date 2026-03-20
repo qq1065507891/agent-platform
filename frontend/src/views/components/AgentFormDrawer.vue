@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { Message } from '@arco-design/web-vue'
 import { createAgent } from '../../api/agents'
+import { uploadKnowledge, type KnowledgeUploadResponse } from '../../api/knowledge'
 import { getSkills, type SkillItem } from '../../api/skills'
 
 const props = defineProps<{ visible: boolean }>()
@@ -18,7 +19,12 @@ const form = reactive({
   prompt_template: '',
   is_public: false,
   skills: [] as string[],
+  knowledgeFiles: [] as File[],
 })
+
+const uploadFileList = ref<any[]>([])
+const uploading = ref(false)
+const uploadResults = ref<KnowledgeUploadResponse[]>([])
 
 const rules = {
   name: [{ required: true, message: '请输入名称' }],
@@ -42,12 +48,25 @@ const fetchSkills = async () => {
   }
 }
 
+const onFileChange = (fileList: any[] | undefined) => {
+  if (!fileList?.length) {
+    form.knowledgeFiles = []
+    return
+  }
+  form.knowledgeFiles = fileList
+    .map((item: any) => item.file as File | undefined)
+    .filter((file: File | undefined): file is File => Boolean(file))
+}
+
 const resetForm = () => {
   form.name = ''
   form.description = ''
   form.prompt_template = ''
   form.is_public = false
   form.skills = []
+  form.knowledgeFiles = []
+  uploadFileList.value = []
+  uploadResults.value = []
 }
 
 const onSubmit = async () => {
@@ -58,19 +77,32 @@ const onSubmit = async () => {
   }
   loading.value = true
   try {
-    await createAgent({
+    const agent = await createAgent({
       name: form.name,
       description: form.description || undefined,
       prompt_template: form.prompt_template,
       is_public: form.is_public,
       skills: form.skills.map((skillId) => ({ skill_id: skillId })),
     })
+
+    if (form.knowledgeFiles.length) {
+      uploading.value = true
+      const results = [] as KnowledgeUploadResponse[]
+      for (const file of form.knowledgeFiles) {
+        const result = await uploadKnowledge(file, agent.id)
+        results.push(result)
+      }
+      uploadResults.value = results
+      Message.success('知识库上传完成')
+    }
+
     Message.success('智能体创建成功')
     emit('created')
     resetForm()
   } catch (error: any) {
     Message.error(error?.message || '创建失败')
   } finally {
+    uploading.value = false
     loading.value = false
   }
 }
@@ -117,6 +149,32 @@ onMounted(fetchSkills)
         />
       </a-form-item>
 
+      <a-form-item field="knowledgeFiles" label="专属知识库">
+        <a-upload
+          v-model:file-list="uploadFileList"
+          :auto-upload="false"
+          multiple
+          :limit="5"
+          accept=".pdf,.doc,.docx,.txt"
+          @change="onFileChange"
+        >
+          <template #upload-button>
+            <a-button type="outline">选择文件</a-button>
+          </template>
+        </a-upload>
+        <div class="upload-tip">支持 PDF/DOC/DOCX/TXT，最多 5 个文件，创建后自动入库</div>
+        <div v-if="form.knowledgeFiles.length" class="upload-list">
+          <div v-for="file in form.knowledgeFiles" :key="file.name" class="upload-item">
+            <span>{{ file.name }}</span>
+          </div>
+        </div>
+        <div v-if="uploadResults.length" class="upload-result">
+          <div v-for="item in uploadResults" :key="item.doc_id">
+            文档 {{ item.doc_id }}：{{ item.chunk_count }} 段（v{{ item.version }}）
+          </div>
+        </div>
+      </a-form-item>
+
       <a-form-item field="is_public" label="是否公开">
         <a-switch v-model="form.is_public" />
       </a-form-item>
@@ -125,7 +183,7 @@ onMounted(fetchSkills)
     <template #footer>
       <a-space>
         <a-button @click="drawerVisible = false">取消</a-button>
-        <a-button type="primary" :loading="loading" @click="onSubmit">创建</a-button>
+        <a-button type="primary" :loading="loading || uploading" @click="onSubmit">创建</a-button>
       </a-space>
     </template>
   </a-drawer>

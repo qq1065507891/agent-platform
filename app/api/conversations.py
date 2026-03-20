@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
@@ -78,3 +79,28 @@ def send_message(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限")
     result = service.add_message(conversation, payload)
     return success_response(result)
+
+
+@router.post("/{conversation_id}/messages/stream")
+def send_message_stream(
+    conversation_id: str,
+    payload: MessageCreate,
+    current_user: UserOut = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    service = ConversationService(db)
+    conversation = service.get_conversation(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
+    if conversation.user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限")
+
+    return StreamingResponse(
+        service.add_message_stream(conversation, payload),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

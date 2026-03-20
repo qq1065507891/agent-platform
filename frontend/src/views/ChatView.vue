@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Message } from '@arco-design/web-vue'
 import request from '../utils/request'
@@ -8,6 +8,8 @@ import { getAgentDetail, listUserConversations } from '../api/agents'
 interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  pending?: boolean
+  interrupted?: boolean
 }
 
 interface Conversation {
@@ -36,6 +38,9 @@ const agentInfo = ref<AgentInfo | null>(null)
 const historyList = ref<Conversation[]>([])
 const expandedAgents = ref<Record<string, boolean>>({})
 const messages = computed(() => conversation.value?.messages ?? [])
+const chatMessagesRef = ref<HTMLElement | null>(null)
+const streamAbortController = ref<AbortController | null>(null)
+const enableStreamMetrics = import.meta.env.VITE_ENABLE_STREAM_METRICS === 'true'
 
 const historyGroups = computed(() => {
   const map: Record<string, { agent_id: string; agent_name?: string; agent_description?: string; items: Conversation[] }> = {}
@@ -98,7 +103,24 @@ const selectConversation = (item: Conversation) => {
   router.push(`/chat/${item.id}`)
 }
 
+const scrollToBottom = async () => {
+  await nextTick()
+  const el = chatMessagesRef.value
+  if (el) {
+    el.scrollTop = el.scrollHeight
+  }
+}
+
+const stopStreaming = () => {
+  if (streamAbortController.value) {
+    streamAbortController.value.abort()
+    streamAbortController.value = null
+  }
+  sending.value = false
+}
+
 const sendMessage = async () => {
+  if (sending.value) return
   if (!conversationId.value || conversationId.value === 'placeholder') {
     Message.warning('请先在智能体市场创建会话')
     return
@@ -107,20 +129,164 @@ const sendMessage = async () => {
     Message.warning('请输入消息')
     return
   }
-  const content = input.value
-  input.value = ''
-  conversation.value?.messages.push({ role: 'user', content })
+  if (!conversation.value) {
+    Message.warning('会话未加载完成，请稍后重试')
+    return
+  }
+
+  const activeMessages = conversation.value.messages.filter((m) => !m.pending)
+  if (activeMessages.length !== conversation.value.messages.length) {
+    conversation.value.messages = activeMessages
+  }
+
   sending.value = true
+  const content = input.value.trim()
+  input.value = ''
+  conversation.value.messages.push({ role: 'user', content })
+  const pendingMessage: ChatMessage = { role: 'assistant', content: '正在思考...', pending: true }
+  conversation.value.messages.push(pendingMessage)
+  await scrollToBottom()
+
+  const controller = new AbortController()
+  streamAbortController.value = controller
+
   try {
-    const data = await request.post(`/conversations/${conversationId.value}/messages`, {
-      content,
-      attachments: [],
+    const token = localStorage.getItem('access_token')
+    const streamStartedAt = performance.now()
+    let firstDeltaAt: number | null = null
+    let deltaCount = 0
+    let deltaChars = 0
+    let transportDelayTotalMs = 0
+    let transportDelayCount = 0
+
+    const response = await fetch(`/api/v1/conversations/${conversationId.value}/messages/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ content, attachments: [] }),
+      signal: controller.signal,
     })
-    conversation.value?.messages.push({ role: 'assistant', content: data.assistant_message })
+
+    if (!response.ok || !response.body) {
+      throw new Error('流式请求失败')
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buffer = ''
+    let fullText = ''
+
+    const setPendingText = async (text: string) => {
+      const pendingIndex = conversation.value!.messages.findIndex((m) => m.pending)
+      if (pendingIndex >= 0) {
+        conversation.value!.messages[pendingIndex] = { role: 'assistant', content: text || '正在思考...', pending: true }
+        await scrollToBottom()
+      }
+    }
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const chunks = buffer.split('\n\n')
+      buffer = chunks.pop() || ''
+
+      for (const chunk of chunks) {
+        const line = chunk
+          .split('\n')
+          .find((item) => item.startsWith('data: '))
+        if (!line) continue
+
+        const raw = line.slice(6)
+        let payload: any
+        try {
+          payload = JSON.parse(raw)
+        } catch {
+          continue
+        }
+
+        if (payload.type === 'delta') {
+          if (firstDeltaAt === null) {
+            firstDeltaAt = performance.now()
+          }
+          const delta = payload.content || ''
+          deltaCount += 1
+          deltaChars += delta.length
+          const serverTs = Number(payload.server_ts_ms || 0)
+          if (serverTs > 0) {
+            const delay = Date.now() - serverTs
+            if (delay >= 0 && delay < 60_000) {
+              transportDelayTotalMs += delay
+              transportDelayCount += 1
+            }
+          }
+          fullText += delta
+          await setPendingText(fullText)
+        }
+
+        if (payload.type === 'done') {
+          fullText = payload.assistant_message || fullText
+        }
+      }
+    }
+
+    const finalReply = fullText.trim() || '已收到你的消息，但当前没有生成文本回复。'
+    const pendingIndex = conversation.value.messages.findIndex((m) => m.pending)
+    if (pendingIndex >= 0) {
+      conversation.value.messages[pendingIndex] = { role: 'assistant', content: finalReply }
+    } else {
+      conversation.value.messages.push({ role: 'assistant', content: finalReply })
+    }
+
+    if (enableStreamMetrics) {
+      const finishedAt = performance.now()
+      const totalSeconds = Math.max((finishedAt - streamStartedAt) / 1000, 0.001)
+      const firstTokenLatencyMs = firstDeltaAt === null ? null : Math.max(firstDeltaAt - streamStartedAt, 0)
+      const tokenPerSecond = deltaCount / totalSeconds
+      const avgTransportDelayMs = transportDelayCount > 0 ? transportDelayTotalMs / transportDelayCount : null
+      console.info('[chat-stream-metrics]', {
+        conversationId: conversationId.value,
+        agentId: conversation.value.agent_id,
+        firstTokenLatencyMs: firstTokenLatencyMs === null ? null : Math.round(firstTokenLatencyMs),
+        avgTransportDelayMs: avgTransportDelayMs === null ? null : Number(avgTransportDelayMs.toFixed(1)),
+        deltaCount,
+        deltaChars,
+        tokenPerSecond: Number(tokenPerSecond.toFixed(2)),
+        totalDurationMs: Math.round(finishedAt - streamStartedAt),
+      })
+    }
   } catch (error: any) {
-    Message.error(error?.message || '发送失败')
+    if (error?.name === 'AbortError') {
+      const pendingIndex = conversation.value.messages.findIndex((m) => m.pending)
+      if (pendingIndex >= 0) {
+        const current = conversation.value.messages[pendingIndex].content.trim()
+        conversation.value.messages[pendingIndex] = {
+          role: 'assistant',
+          content: current || '已停止生成。',
+          interrupted: true,
+        }
+      }
+      Message.info('已停止生成')
+    } else {
+      const pendingIndex = conversation.value.messages.findIndex((m) => m.pending)
+      if (pendingIndex >= 0) {
+        conversation.value.messages[pendingIndex] = {
+          role: 'assistant',
+          content: '本次回复失败，请稍后重试。',
+        }
+      } else {
+        conversation.value.messages.push({ role: 'assistant', content: '本次回复失败，请稍后重试。' })
+      }
+      Message.error(error?.message || '发送失败')
+    }
   } finally {
+    streamAbortController.value = null
     sending.value = false
+    await scrollToBottom()
+    fetchHistoryList()
   }
 }
 
@@ -187,18 +353,18 @@ watch(
             <div class="agent-desc">{{ agentInfo?.description || '请从智能体市场发起会话' }}</div>
           </div>
         </div>
-        <div class="chat-messages">
+        <div ref="chatMessagesRef" class="chat-messages">
           <div
             v-for="(msg, idx) in messages"
             :key="idx"
             :class="['bubble', msg.role]"
           >
             <div class="role">{{ msg.role === 'user' ? '你' : '智能体' }}</div>
-            <div class="content">{{ msg.content }}</div>
-          </div>
-          <div v-if="sending" class="bubble assistant">
-            <div class="role">智能体</div>
-            <div class="content">正在思考...</div>
+            <div class="content">
+              {{ msg.content }}
+              <span v-if="msg.pending" class="typing-cursor" aria-hidden="true"></span>
+              <span v-if="msg.interrupted && !msg.pending" class="interrupted-tag">（已中断）</span>
+            </div>
           </div>
         </div>
         <div class="chat-input">
@@ -209,6 +375,7 @@ watch(
             @keydown.enter.exact.prevent="sendMessage"
           />
           <a-button type="primary" :loading="sending" @click="sendMessage">发送</a-button>
+          <a-button v-if="sending" status="danger" @click="stopStreaming">停止生成</a-button>
         </div>
       </div>
     </a-spin>
@@ -434,6 +601,34 @@ watch(
   font-size: 12px;
   opacity: 0.7;
   margin-bottom: 6px;
+}
+
+.typing-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 1em;
+  margin-left: 3px;
+  vertical-align: text-bottom;
+  background: currentColor;
+  animation: blink 1s steps(1, end) infinite;
+  opacity: 0.85;
+}
+
+.interrupted-tag {
+  margin-left: 6px;
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+@keyframes blink {
+  0%,
+  49% {
+    opacity: 0.85;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
 }
 
 .chat-input {
