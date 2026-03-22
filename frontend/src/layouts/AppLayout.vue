@@ -10,6 +10,7 @@ const authStore = useAuthStore()
 const selectedKey = computed(() => {
   if (route.path.startsWith('/admin/users')) return 'admin-users'
   if (route.path.startsWith('/admin/roles')) return 'admin-roles'
+  if (route.path.startsWith('/admin/skills')) return 'admin-skills'
   if (route.path.startsWith('/chat')) return 'chat'
   if (route.path.startsWith('/my-agents')) return 'my-agents'
   if (route.path.startsWith('/agents')) return 'agents'
@@ -31,6 +32,9 @@ const onMenuClick = (key: string) => {
   }
   if (key === 'admin-roles') {
     router.push('/admin/roles')
+  }
+  if (key === 'admin-skills') {
+    router.push('/admin/skills')
   }
 }
 
@@ -60,6 +64,7 @@ const onLogout = () => {
             <template #title>系统管理</template>
             <a-menu-item key="admin-users">用户管理</a-menu-item>
             <a-menu-item key="admin-roles">角色管理</a-menu-item>
+            <a-menu-item key="admin-skills">技能管理</a-menu-item>
           </a-sub-menu>
         </a-menu>
       </a-layout-sider>

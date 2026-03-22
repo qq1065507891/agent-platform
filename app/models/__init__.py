@@ -5,7 +5,7 @@ from app.models.llm_usage import LLMUsage
 from app.models.permission import PermissionGrant
 from app.models.request_log import RequestLog
 from app.models.role import Role
-from app.models.skill import Skill
+from app.models.skill import ExternalSkillRevision, Skill
 from app.models.skill_invocation import SkillInvocation
 from app.models.user import User
 
@@ -18,6 +18,7 @@ __all__ = [
     "RequestLog",
     "Role",
     "Skill",
+    "ExternalSkillRevision",
     "SkillInvocation",
     "User",
 ]

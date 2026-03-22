@@ -2,18 +2,23 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Iterator, TypedDict
 from typing_extensions import Annotated
+import json
 import logging
 
 from langchain_core.messages import AnyMessage, AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langchain_core.tools import tool
 
 from app.core.config import settings
-from app.services.skills.builtin import BUILTIN_TOOLS
+from app.core.database import SessionLocal
+from app.models.agent import Agent
 from app.services.rag_service import get_rag_service
+from app.services.sandbox import SandboxSecurityError, SandboxTimeoutError, execute_skill_code_safely
+from app.services.skills.builtin import BUILTIN_TOOLS
+from app.services.skills.service import SkillService
 
 EMPTY_ASSISTANT_REPLY = "已收到你的消息，但当前没有生成文本回复。"
 
@@ -43,6 +48,83 @@ def _should_continue(state: AgentState) -> str:
     return "end"
 
 
+def _build_external_skill_tools(agent_id: str | None) -> list[Any]:
+    if not agent_id:
+        return []
+
+    db = SessionLocal()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        if not agent or not isinstance(agent.skills, list):
+            return []
+
+        service = SkillService(db)
+        tools: list[Any] = []
+
+        for skill_item in agent.skills:
+            if not isinstance(skill_item, dict):
+                continue
+            code = skill_item.get("skill_id")
+            if not code or code in BUILTIN_TOOLS:
+                continue
+
+            skill_code = str(code)
+
+            @tool(skill_code)
+            def _external_tool(payload: str = "{}", _skill_code: str = skill_code) -> str:
+                """执行外部自定义技能（沙箱模式）。"""
+                try:
+                    params = json.loads(payload) if payload else {}
+                except json.JSONDecodeError:
+                    params = {"raw": payload}
+
+                script = service.get_skill_execution_code(_skill_code)
+                if not script:
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": f"skill {_skill_code} is unavailable or disabled",
+                            "result": None,
+                        },
+                        ensure_ascii=False,
+                    )
+
+                try:
+                    result = execute_skill_code_safely(
+                        code=script,
+                        params=params,
+                        timeout_seconds=settings.skill_sandbox_timeout_seconds,
+                    )
+                except SandboxTimeoutError as exc:
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": f"timeout: {exc}",
+                            "error_code": 5004,
+                            "result": None,
+                        },
+                        ensure_ascii=False,
+                    )
+                except SandboxSecurityError as exc:
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": f"security_reject: {exc}",
+                            "error_code": 5002,
+                            "result": None,
+                        },
+                        ensure_ascii=False,
+                    )
+
+                return json.dumps(result, ensure_ascii=False)
+
+            tools.append(_external_tool)
+
+        return tools
+    finally:
+        db.close()
+
+
 def build_agent_graph(agent_id: str | None = None) -> Any:
     rag_service = get_rag_service()
 
@@ -58,7 +140,8 @@ def build_agent_graph(agent_id: str | None = None) -> Any:
         except Exception:
             return "知识库检索暂时不可用，请基于通用知识回答并提示用户稍后重试。"
 
-    tools = [*list(BUILTIN_TOOLS.values()), retriever_tool]
+    dynamic_tools = _build_external_skill_tools(agent_id)
+    tools = [*list(BUILTIN_TOOLS.values()), retriever_tool, *dynamic_tools]
     llm = _load_llm().bind_tools(tools)
 
     def llm_node(state: AgentState) -> dict[str, Iterable[AnyMessage]]:

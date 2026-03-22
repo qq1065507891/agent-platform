@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SkillBase(BaseModel):
@@ -40,7 +40,47 @@ class SkillUpdate(BaseModel):
     yaml_definition: dict | None = None
 
 
-class SkillOut(SkillBase):
+class SkillOut(BaseModel):
+    """输出模型保持兼容，避免历史数据因严格正则导致列表接口 500。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
+    skill_id: str
+    name: str
+    description: str | None = None
+    version: str
+    category: str
+    source_type: str
+    status: str
+    yaml_definition: dict | None = None
     source_url: str | None = None
     source_version: str | None = None
+    current_revision_id: str | None = None
+
+
+class SkillLoadRequest(BaseModel):
+    source_type: str = Field(..., pattern=r"^(github|npm|http|local|private_registry)$")
+    source_url: str | None = None
+    source_version: str | None = None
+    package_path: str | None = None
+    expected_hash: str | None = Field(None, min_length=32, max_length=128)
+    skill_id: str | None = None
+    name: str | None = None
+
+
+class SkillLoadResponse(BaseModel):
+    task_id: str
+    skill_id: str
+    status: str = "pending"
+
+
+class SkillTaskStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    result: dict | None = None
+    error: str | None = None
+
+
+class SkillDisableRequest(BaseModel):
+    reason: str | None = Field(None, max_length=255)

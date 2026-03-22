@@ -6,6 +6,10 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    app_env: str = "dev"
+    app_host: str = "0.0.0.0"
+    app_port: int = 8000
+
     llm_gateway_url: str = ""
     llm_api_key: str = "EMPTY"
     llm_model: str = "gpt-4o-mini"
@@ -19,6 +23,17 @@ class Settings(BaseSettings):
 
     chroma_url: str = ""
     chroma_persist_path: str = "./chroma"
+
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    celery_broker_url: str = "redis://127.0.0.1:6379/1"
+    celery_result_backend: str = "redis://127.0.0.1:6379/2"
+    celery_task_serializer: str = "json"
+    celery_result_serializer: str = "json"
+    celery_accept_content: list[str] = ["json"]
+    celery_task_time_limit: int = 30
+
+    skill_sandbox_mode: str = "isolated"
+    skill_sandbox_timeout_seconds: int = 10
 
     class Config:
         env_prefix = ""

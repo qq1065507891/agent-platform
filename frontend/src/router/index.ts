@@ -33,6 +33,12 @@ const routes: RouteRecordRaw[] = [
         component: () => import('../views/AdminRolesView.vue'),
         meta: { requireAdmin: true },
       },
+      {
+        path: 'admin/skills',
+        name: 'admin-skills',
+        component: () => import('../views/AdminSkillsView.vue'),
+        meta: { requireAdmin: true },
+      },
     ],
   },
   { path: '/:pathMatch(.*)*', redirect: '/agents' },

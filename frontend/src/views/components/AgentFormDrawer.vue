@@ -36,11 +36,66 @@ const drawerVisible = computed({
   set: (value: boolean) => emit('update:visible', value),
 })
 
+const selectableSkillIds = computed(() =>
+  new Set(skillOptions.value.filter((item) => item.status === 'active').map((item) => item.skill_id))
+)
+
+const getUnavailableSkillStatusLabel = (item: SkillItem) => {
+  if (item.status === 'active') {
+    return '可用'
+  }
+
+  // 外部技能创建后会先进入异步任务，期间常见表现是 disabled 且无 current_revision_id
+  if (item.source_type !== 'builtin' && !item.current_revision_id) {
+    return '加载中'
+  }
+
+  // 外部技能有 revision 但仍为 disabled，通常是扫描不通过或被人工禁用
+  if (item.source_type !== 'builtin' && item.current_revision_id) {
+    return '审核失败/已禁用'
+  }
+
+  return '已禁用'
+}
+
+const selectOptions = computed(() => {
+  return skillOptions.value
+    .map((item) => {
+      const active = item.status === 'active'
+      return {
+        label: active
+          ? `【可用】${item.name}`
+          : `【不可用】${item.name}（${getUnavailableSkillStatusLabel(item)}）`,
+        value: item.skill_id,
+        disabled: !active,
+      }
+    })
+    .sort((a, b) => {
+      if (a.disabled !== b.disabled) return a.disabled ? 1 : -1
+      return a.label.localeCompare(b.label, 'zh-CN')
+    })
+})
+
 const fetchSkills = async () => {
   skillsLoading.value = true
   try {
-    const data = await getSkills({ page: 1, page_size: 100, status: 'active' })
-    skillOptions.value = data.list
+    // 不再仅请求 active，避免“新技能处于 disabled/pending 时完全不可见”
+    // 同时拉取多页，避免 page_size 上限导致新技能落在后页而看不到。
+    const pageSize = 100
+    let page = 1
+    let total = 0
+    const all: SkillItem[] = []
+
+    do {
+      const data = await getSkills({ page, page_size: pageSize, status: 'active' })
+      const list = Array.isArray(data?.list) ? data.list : []
+      total = Number(data?.total || 0)
+      all.push(...list)
+      page += 1
+    } while ((page - 1) * pageSize < total && page <= 20)
+
+    skillOptions.value = all
+    form.skills = form.skills.filter((id) => selectableSkillIds.value.has(id))
   } catch (error: any) {
     Message.error(error?.message || '获取技能失败')
   } finally {
@@ -143,7 +198,7 @@ onMounted(fetchSkills)
           v-model="form.skills"
           placeholder="请选择技能"
           :loading="skillsLoading"
-          :options="skillOptions.map((item) => ({ label: item.name, value: item.skill_id }))"
+          :options="selectOptions"
           multiple
           allow-clear
         />
