@@ -6,4 +6,4 @@ from app.schemas.common import APIResponse
 
 
 def success_response(data: Any | None = None) -> APIResponse:
-    return APIResponse(code=0, message="ok", data=data or {})
+    return APIResponse(code=0, message="ok", data={} if data is None else data)

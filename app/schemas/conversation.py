@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class ConversationBase(BaseModel):
     agent_id: str
     user_id: str | None = None
+    title: str | None = None
     messages: list[dict] | None = None
 
 
@@ -17,6 +18,10 @@ class ConversationCreate(BaseModel):
 class MessageCreate(BaseModel):
     content: str = Field(..., min_length=1, max_length=4000)
     attachments: list[dict] | None = None
+
+
+class ConversationRename(BaseModel):
+    title: str = Field(..., min_length=1, max_length=120)
 
 
 class ConversationOut(ConversationBase):

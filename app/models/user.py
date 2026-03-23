@@ -15,5 +15,9 @@ class User(BaseModel, UUIDPrimaryKeyMixin, TimestampMixin):
     role: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
 
-    agents = relationship("Agent", back_populates="owner")
-    conversations = relationship("Conversation", back_populates="user")
+    agents = relationship(
+        "Agent", back_populates="owner", cascade="all, delete-orphan", passive_deletes=True
+    )
+    conversations = relationship(
+        "Conversation", back_populates="user", cascade="all, delete-orphan", passive_deletes=True
+    )

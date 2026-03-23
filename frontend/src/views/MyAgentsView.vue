@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { Message } from '@arco-design/web-vue'
-import { getAgents } from '../api/agents'
+import { Message, Modal } from '@arco-design/web-vue'
+import { deleteAgent, getAgents } from '../api/agents'
 import AgentFormDrawer from './components/AgentFormDrawer.vue'
 
 interface AgentItem {
@@ -17,6 +17,7 @@ const loading = ref(false)
 const keyword = ref('')
 const agents = ref<AgentItem[]>([])
 const drawerVisible = ref(false)
+const deletingAgentId = ref<string>('')
 const pagination = reactive({
   page: 1,
   pageSize: 12,
@@ -32,9 +33,15 @@ const fetchAgents = async () => {
       keyword: keyword.value || undefined,
       mine: true,
     })
-    agents.value = data.list
-    pagination.total = data.total
+    agents.value = Array.isArray(data?.list) ? data.list : []
+    pagination.total = Number(data?.total || 0)
   } catch (error: any) {
+    const detail = error?.response?.data?.detail
+    if (detail === '会话不存在') {
+      agents.value = []
+      pagination.total = 0
+      return
+    }
     Message.error(error?.message || '获取智能体失败')
   } finally {
     loading.value = false
@@ -51,6 +58,35 @@ const onCreated = () => {
   fetchAgents()
 }
 
+const onDeleteAgent = (agent: AgentItem) => {
+  Modal.confirm({
+    title: '确认删除该智能体？',
+    content: `删除后不可恢复：${agent.name}`,
+    okButtonProps: { status: 'danger' },
+    onOk: async () => {
+      if (deletingAgentId.value) return
+      deletingAgentId.value = agent.id
+      try {
+        await deleteAgent(agent.id)
+        Message.success('智能体已删除')
+        if (agents.value.length === 1 && pagination.page > 1) {
+          pagination.page -= 1
+        }
+        await fetchAgents()
+      } catch (error: any) {
+        const detail = error?.response?.data?.detail
+        if (detail === '无权限') {
+          Message.error('无权限删除该智能体，仅可删除自己创建的智能体')
+        } else {
+          Message.error(detail || error?.message || '删除失败')
+        }
+      } finally {
+        deletingAgentId.value = ''
+      }
+    },
+  })
+}
+
 onMounted(fetchAgents)
 </script>
 
@@ -65,7 +101,21 @@ onMounted(fetchAgents)
       <a-row :gutter="16">
         <a-col v-for="agent in agents" :key="agent.id" :xs="24" :sm="12" :md="8" :lg="6">
           <a-card class="agent-card" hoverable>
-            <template #title>{{ agent.name }}</template>
+            <template #title>
+              <div class="card-title">
+                <span class="card-title-text">{{ agent.name }}</span>
+                <a-button
+                  size="mini"
+                  type="text"
+                  status="danger"
+                  :loading="deletingAgentId === agent.id"
+                  :disabled="!!deletingAgentId && deletingAgentId !== agent.id"
+                  @click.stop="onDeleteAgent(agent)"
+                >
+                  删除
+                </a-button>
+              </div>
+            </template>
             <p class="desc">{{ agent.description || '暂无描述' }}</p>
             <div class="meta">
               <span>状态：{{ agent.status || 'draft' }}</span>
@@ -99,6 +149,19 @@ onMounted(fetchAgents)
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.card-title-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .desc {

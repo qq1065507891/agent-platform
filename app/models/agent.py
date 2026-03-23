@@ -11,11 +11,15 @@ class Agent(BaseModel, UUIDPrimaryKeyMixin, TimestampMixin):
 
     name: Mapped[str] = mapped_column(String(50), nullable=False)
     description: Mapped[str | None] = mapped_column(String(200))
-    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    owner_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     prompt_template: Mapped[str] = mapped_column(String(4000), nullable=False)
     skills: Mapped[list | None] = mapped_column(JSONType, nullable=True)
     is_public: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False)
 
     owner = relationship("User", back_populates="agents")
-    conversations = relationship("Conversation", back_populates="agent")
+    conversations = relationship(
+        "Conversation", back_populates="agent", cascade="all, delete-orphan", passive_deletes=True
+    )

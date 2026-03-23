@@ -45,12 +45,10 @@ const getUnavailableSkillStatusLabel = (item: SkillItem) => {
     return '可用'
   }
 
-  // 外部技能创建后会先进入异步任务，期间常见表现是 disabled 且无 current_revision_id
   if (item.source_type !== 'builtin' && !item.current_revision_id) {
     return '加载中'
   }
 
-  // 外部技能有 revision 但仍为 disabled，通常是扫描不通过或被人工禁用
   if (item.source_type !== 'builtin' && item.current_revision_id) {
     return '审核失败/已禁用'
   }
@@ -60,6 +58,7 @@ const getUnavailableSkillStatusLabel = (item: SkillItem) => {
 
 const selectOptions = computed(() => {
   return skillOptions.value
+    .filter((item) => item && typeof item.skill_id === 'string' && typeof item.name === 'string')
     .map((item) => {
       const active = item.status === 'active'
       return {
@@ -79,8 +78,6 @@ const selectOptions = computed(() => {
 const fetchSkills = async () => {
   skillsLoading.value = true
   try {
-    // 不再仅请求 active，避免“新技能处于 disabled/pending 时完全不可见”
-    // 同时拉取多页，避免 page_size 上限导致新技能落在后页而看不到。
     const pageSize = 100
     let page = 1
     let total = 0
@@ -88,7 +85,9 @@ const fetchSkills = async () => {
 
     do {
       const data = await getSkills({ page, page_size: pageSize, status: 'active' })
-      const list = Array.isArray(data?.list) ? data.list : []
+      const list = Array.isArray(data?.list)
+        ? data.list.filter((item: SkillItem) => item && typeof item.skill_id === 'string')
+        : []
       total = Number(data?.total || 0)
       all.push(...list)
       page += 1
@@ -127,9 +126,10 @@ const resetForm = () => {
 const onSubmit = async () => {
   try {
     await formRef.value?.validate()
-  } catch (error) {
+  } catch {
     return
   }
+
   loading.value = true
   try {
     const agent = await createAgent({
@@ -201,6 +201,7 @@ onMounted(fetchSkills)
           :options="selectOptions"
           multiple
           allow-clear
+          :max-tag-count="2"
         />
       </a-form-item>
 
@@ -243,3 +244,28 @@ onMounted(fetchSkills)
     </template>
   </a-drawer>
 </template>
+
+<style scoped>
+.upload-tip {
+  margin-top: 8px;
+  color: rgb(var(--gray-6));
+  font-size: 12px;
+}
+
+.upload-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.upload-item {
+  color: rgb(var(--gray-8));
+}
+
+.upload-result {
+  margin-top: 8px;
+  color: rgb(var(--green-6));
+  font-size: 12px;
+}
+</style>

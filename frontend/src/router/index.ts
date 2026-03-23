@@ -39,6 +39,18 @@ const routes: RouteRecordRaw[] = [
         component: () => import('../views/AdminSkillsView.vue'),
         meta: { requireAdmin: true },
       },
+      {
+        path: 'admin/agents',
+        name: 'admin-agents',
+        component: () => import('../views/AdminAgentsView.vue'),
+        meta: { requireAdmin: true },
+      },
+      {
+        path: 'admin/dashboard',
+        name: 'admin-dashboard',
+        component: () => import('../views/AdminDashboardView.vue'),
+        meta: { requireAdmin: true },
+      },
     ],
   },
   { path: '/:pathMatch(.*)*', redirect: '/agents' },
@@ -49,25 +61,25 @@ const router = createRouter({
   routes,
 })
 
-router.beforeEach((to, _from, next) => {
+router.beforeEach((to) => {
   if (to.meta.public) {
-    next()
-    return
+    return true
   }
+
   const token = localStorage.getItem('access_token')
   if (!token) {
-    next('/login')
-    return
+    return '/login'
   }
+
   if (to.meta.requireAdmin) {
     const raw = localStorage.getItem('user')
     const user = raw ? JSON.parse(raw) : null
     if (!user || user.role !== 'admin') {
-      next('/agents')
-      return
+      return '/agents'
     }
   }
-  next()
+
+  return true
 })
 
 export default router

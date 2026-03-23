@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import decode_access_token
 from app.models.user import User
+from app.observability.context import set_user_id
 from .database import SessionLocal
 
 
@@ -39,6 +40,7 @@ def get_current_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user or user.status != "active":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未认证")
+    set_user_id(user.id)
     return user
 
 

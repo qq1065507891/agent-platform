@@ -4,6 +4,7 @@ from typing import Any, Iterable, Iterator, TypedDict
 from typing_extensions import Annotated
 import json
 import logging
+import time
 
 from langchain_core.messages import AnyMessage, AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_core.tools import tool
@@ -15,6 +16,8 @@ from langgraph.prebuilt import ToolNode
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.agent import Agent
+from app.observability.context import get_agent_id, get_conversation_id, get_trace_id, get_user_id
+from app.observability.service import ObservabilityService
 from app.services.rag_service import get_rag_service
 from app.services.sandbox import SandboxSecurityError, SandboxTimeoutError, execute_skill_code_safely
 from app.services.skills.builtin import BUILTIN_TOOLS
@@ -23,6 +26,26 @@ from app.services.skills.service import SkillService
 EMPTY_ASSISTANT_REPLY = "已收到你的消息，但当前没有生成文本回复。"
 
 logger = logging.getLogger(__name__)
+
+
+def _log_skill_invocation(skill_id: str, status: str, latency_ms: int, error_code: str | None) -> None:
+    db = SessionLocal()
+    try:
+        ObservabilityService(db).log_skill_invocation(
+            skill_id=skill_id,
+            status=status,
+            latency_ms=latency_ms,
+            error_code=error_code,
+            trace_id=get_trace_id(),
+            user_id=get_user_id(),
+            agent_id=get_agent_id(),
+            conversation_id=get_conversation_id(),
+        )
+    except Exception as exc:
+        logger.warning("failed to persist skill invocation: %s", exc)
+        db.rollback()
+    finally:
+        db.close()
 
 
 class AgentState(TypedDict):
@@ -73,6 +96,7 @@ def _build_external_skill_tools(agent_id: str | None) -> list[Any]:
             @tool(skill_code)
             def _external_tool(payload: str = "{}", _skill_code: str = skill_code) -> str:
                 """执行外部自定义技能（沙箱模式）。"""
+                start = time.perf_counter()
                 try:
                     params = json.loads(payload) if payload else {}
                 except json.JSONDecodeError:
@@ -80,6 +104,7 @@ def _build_external_skill_tools(agent_id: str | None) -> list[Any]:
 
                 script = service.get_skill_execution_code(_skill_code)
                 if not script:
+                    _log_skill_invocation(_skill_code, "failed", int((time.perf_counter() - start) * 1000), "skill_unavailable")
                     return json.dumps(
                         {
                             "ok": False,
@@ -96,6 +121,7 @@ def _build_external_skill_tools(agent_id: str | None) -> list[Any]:
                         timeout_seconds=settings.skill_sandbox_timeout_seconds,
                     )
                 except SandboxTimeoutError as exc:
+                    _log_skill_invocation(_skill_code, "failed", int((time.perf_counter() - start) * 1000), "5004")
                     return json.dumps(
                         {
                             "ok": False,
@@ -106,6 +132,7 @@ def _build_external_skill_tools(agent_id: str | None) -> list[Any]:
                         ensure_ascii=False,
                     )
                 except SandboxSecurityError as exc:
+                    _log_skill_invocation(_skill_code, "failed", int((time.perf_counter() - start) * 1000), "5002")
                     return json.dumps(
                         {
                             "ok": False,
@@ -116,6 +143,7 @@ def _build_external_skill_tools(agent_id: str | None) -> list[Any]:
                         ensure_ascii=False,
                     )
 
+                _log_skill_invocation(_skill_code, "success", int((time.perf_counter() - start) * 1000), None)
                 return json.dumps(result, ensure_ascii=False)
 
             tools.append(_external_tool)
@@ -145,7 +173,35 @@ def build_agent_graph(agent_id: str | None = None) -> Any:
     llm = _load_llm().bind_tools(tools)
 
     def llm_node(state: AgentState) -> dict[str, Iterable[AnyMessage]]:
+        start = time.perf_counter()
         response = llm.invoke(state.get("messages", []))
+        latency_ms = int((time.perf_counter() - start) * 1000)
+
+        usage = getattr(response, "usage_metadata", None) or {}
+        prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+
+        db = SessionLocal()
+        try:
+            ObservabilityService(db).log_llm_usage(
+                model=getattr(response, "response_metadata", {}).get("model_name") or settings.llm_model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cost=0,
+                latency_ms=latency_ms,
+                trace_id=get_trace_id(),
+                user_id=get_user_id(),
+                agent_id=get_agent_id() or agent_id,
+                conversation_id=get_conversation_id(),
+            )
+        except Exception as exc:
+            logger.warning("failed to persist llm usage: %s", exc)
+            db.rollback()
+        finally:
+            db.close()
+
         return {"messages": [response]}
 
     tool_node = ToolNode(tools)

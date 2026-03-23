@@ -20,6 +20,7 @@ class LLMUsage(BaseModel, UUIDPrimaryKeyMixin):
     cost: Mapped[float] = mapped_column(Numeric(12, 4), nullable=False)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     trace_id: Mapped[str | None] = mapped_column(String(64))
+    conversation_id: Mapped[str | None] = mapped_column(String(36))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow, nullable=False
     )

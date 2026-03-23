@@ -5,12 +5,14 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.models.agent import Agent
+from app.observability.service import ObservabilityService
 from app.schemas.agent import AgentCreate, AgentUpdate
 
 
 class AgentService:
     def __init__(self, db: Session) -> None:
         self.db = db
+        self.observability = ObservabilityService(db)
 
     @staticmethod
     def _sanitize_skills(raw_skills: list[dict] | None) -> list[dict] | None:
@@ -63,6 +65,12 @@ class AgentService:
         self.db.add(agent)
         self.db.commit()
         self.db.refresh(agent)
+        self.observability.log_event(
+            event_type="agent_created",
+            user_id=owner_id,
+            agent_id=agent.id,
+            metadata={"agent_id": agent.id, "status": agent.status},
+        )
         return agent
 
     def get_agent(self, agent_id: str) -> Agent | None:
@@ -84,3 +92,14 @@ class AgentService:
         self.db.refresh(agent)
         agent.skills = self._sanitize_skills(agent.skills)
         return agent
+
+    def delete_agent(self, agent_id: str) -> None:
+        agent = self.db.query(Agent).filter(Agent.id == agent_id).first()
+        if not agent:
+            raise ValueError("智能体不存在")
+        try:
+            self.db.delete(agent)
+            self.db.commit()
+        except Exception as exc:
+            self.db.rollback()
+            raise RuntimeError("删除智能体失败，请稍后重试") from exc

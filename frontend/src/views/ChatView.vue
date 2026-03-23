@@ -1,9 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch, nextTick } from 'vue'
+import { computed, h, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Message } from '@arco-design/web-vue'
+import { Message, Modal } from '@arco-design/web-vue'
 import request from '../utils/request'
-import { getAgentDetail, listUserConversations } from '../api/agents'
+import {
+  deleteConversation,
+  getAgentDetail,
+  listUserConversations,
+  renameConversation,
+} from '../api/agents'
 
 interface ChatMessage {
   role: 'user' | 'assistant'
@@ -15,6 +20,7 @@ interface ChatMessage {
 interface Conversation {
   id: string
   agent_id: string
+  title?: string
   messages: ChatMessage[]
   agent_name?: string
   agent_description?: string
@@ -41,6 +47,14 @@ const messages = computed(() => conversation.value?.messages ?? [])
 const chatMessagesRef = ref<HTMLElement | null>(null)
 const streamAbortController = ref<AbortController | null>(null)
 const enableStreamMetrics = import.meta.env.VITE_ENABLE_STREAM_METRICS === 'true'
+const deletingConversationId = ref('')
+const renamingConversationId = ref('')
+const contextMenu = ref({
+  visible: false,
+  x: 0,
+  y: 0,
+  item: null as Conversation | null,
+})
 
 const historyGroups = computed(() => {
   const map: Record<string, { agent_id: string; agent_name?: string; agent_description?: string; items: Conversation[] }> = {}
@@ -100,7 +114,117 @@ const fetchHistoryList = async () => {
 
 const selectConversation = (item: Conversation) => {
   if (!item?.id) return
+  hideContextMenu()
   router.push(`/chat/${item.id}`)
+}
+
+const hideContextMenu = () => {
+  contextMenu.value.visible = false
+  contextMenu.value.item = null
+}
+
+const onConversationContextMenu = (event: MouseEvent, item: Conversation) => {
+  event.preventDefault()
+  const menuWidth = 140
+  const menuHeight = 44
+  const padding = 8
+  const maxX = window.innerWidth - menuWidth - padding
+  const maxY = window.innerHeight - menuHeight - padding
+  contextMenu.value = {
+    visible: true,
+    x: Math.min(event.clientX, maxX),
+    y: Math.min(event.clientY, maxY),
+    item,
+  }
+}
+
+const onCopyConversationId = async () => {
+  const item = contextMenu.value.item
+  hideContextMenu()
+  if (!item?.id) return
+  try {
+    await navigator.clipboard.writeText(item.id)
+    Message.success('会话 ID 已复制')
+  } catch {
+    Message.error('复制失败，请手动复制')
+  }
+}
+
+const onRenameConversation = () => {
+  const item = contextMenu.value.item
+  hideContextMenu()
+  if (!item?.id) return
+
+  let titleValue = item.title || ''
+  Modal.confirm({
+    title: '重命名会话',
+    content: () =>
+      h('div', { style: 'display:flex;flex-direction:column;gap:8px;' }, [
+        h('span', '请输入新的会话标题'),
+        h('input', {
+          value: titleValue,
+          maxlength: 120,
+          placeholder: '例如：面试题整理',
+          style:
+            'width:100%;padding:8px 10px;border:1px solid #dcdfe6;border-radius:6px;outline:none;',
+          onInput: (e: Event) => {
+            const target = e.target as HTMLInputElement
+            titleValue = target.value
+          },
+        }),
+      ]),
+    onOk: async () => {
+      const nextTitle = titleValue.trim()
+      if (!nextTitle) {
+        Message.warning('标题不能为空')
+        throw new Error('标题不能为空')
+      }
+      if (renamingConversationId.value) return
+      renamingConversationId.value = item.id
+      try {
+        await renameConversation(item.id, { title: nextTitle })
+        Message.success('会话已重命名')
+        await fetchHistoryList()
+      } catch (error: any) {
+        const detail = error?.response?.data?.detail
+        Message.error(detail || error?.message || '重命名失败')
+        throw error
+      } finally {
+        renamingConversationId.value = ''
+      }
+    },
+  })
+}
+
+const onDeleteConversation = () => {
+  const item = contextMenu.value.item
+  hideContextMenu()
+  if (!item?.id) return
+
+  Modal.confirm({
+    title: '确认删除该会话？',
+    content: `删除后不可恢复：${item.title || `会话 ${item.id.slice(0, 6)}`}`,
+    okButtonProps: { status: 'danger', loading: deletingConversationId.value === item.id },
+    onOk: async () => {
+      if (deletingConversationId.value) return
+      deletingConversationId.value = item.id
+      try {
+        await deleteConversation(item.id)
+        Message.success('会话已删除')
+        if (conversationId.value === item.id) {
+          conversation.value = null
+          agentInfo.value = null
+          router.push('/chat/placeholder')
+        }
+        await fetchHistoryList()
+      } catch (error: any) {
+        const detail = error?.response?.data?.detail
+        Message.error(detail || error?.message || '删除会话失败')
+      } finally {
+        deletingConversationId.value = ''
+      }
+    },
+  })
 }
 
 const scrollToBottom = async () => {
@@ -293,6 +417,13 @@ const sendMessage = async () => {
 onMounted(() => {
   fetchConversation()
   fetchHistoryList()
+  window.addEventListener('click', hideContextMenu)
+  window.addEventListener('contextmenu', hideContextMenu)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('click', hideContextMenu)
+  window.removeEventListener('contextmenu', hideContextMenu)
 })
 
 watch(
@@ -335,8 +466,9 @@ watch(
                 :key="item.id"
                 class="history-item"
                 @click="selectConversation(item)"
+                @contextmenu="onConversationContextMenu($event, item)"
               >
-                <div class="history-title">会话 {{ item.id.slice(0, 6) }}</div>
+                <div class="history-title">{{ item.title || `会话 ${item.id.slice(0, 6)}` }}</div>
                 <div class="history-meta">{{ formatTimestamp(item.created_at) }}</div>
               </div>
             </div>
@@ -379,18 +511,73 @@ watch(
         </div>
       </div>
     </a-spin>
+
+    <div
+      v-if="contextMenu.visible"
+      class="context-menu"
+      :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }"
+      @click.stop
+    >
+      <a-button
+        type="text"
+        size="mini"
+        class="context-menu-item"
+        :disabled="!!deletingConversationId || !!renamingConversationId"
+        @click="onCopyConversationId"
+      >
+        复制会话 ID
+      </a-button>
+      <a-button
+        type="text"
+        size="mini"
+        class="context-menu-item"
+        :loading="renamingConversationId === contextMenu.item?.id"
+        :disabled="!!deletingConversationId"
+        @click="onRenameConversation"
+      >
+        重命名会话
+      </a-button>
+      <a-button
+        type="text"
+        status="danger"
+        size="mini"
+        class="context-menu-item"
+        :loading="deletingConversationId === contextMenu.item?.id"
+        :disabled="!!renamingConversationId"
+        @click="onDeleteConversation"
+      >
+        删除会话
+      </a-button>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .chat-page {
   height: calc(100vh - 112px);
+  position: relative;
 }
 
 .chat-shell {
   display: flex;
   height: 100%;
   gap: 16px;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 2000;
+  min-width: 120px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.18);
+  padding: 6px;
+}
+
+.context-menu-item {
+  width: 100%;
+  justify-content: flex-start;
 }
 
 .chat-sidebar {

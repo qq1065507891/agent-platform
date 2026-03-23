@@ -231,7 +231,11 @@ const resetLoadForm = () => {
 }
 
 const getErrorDetail = (error: any, fallback: string) => {
-  return error?.response?.data?.detail || error?.response?.data?.message || error?.message || fallback
+  const data = error?.response?.data
+  if (typeof data?.detail === 'string' && data.detail) return data.detail
+  if (typeof data?.detail?.reason === 'string' && data.detail.reason) return data.detail.reason
+  if (typeof data?.message === 'string' && data.message) return data.message
+  return error?.message || fallback
 }
 
 const onSubmitLoad = async () => {

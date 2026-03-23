@@ -14,6 +14,7 @@ class EventLog(BaseModel, UUIDPrimaryKeyMixin):
     event_type: Mapped[str] = mapped_column(String(50), nullable=False)
     user_id: Mapped[str | None] = mapped_column(String(36))
     agent_id: Mapped[str | None] = mapped_column(String(36))
+    conversation_id: Mapped[str | None] = mapped_column(String(36))
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONType)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow, nullable=False

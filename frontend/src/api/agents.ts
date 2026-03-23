@@ -26,5 +26,12 @@ export const createAgent = (payload: AgentPayload) => request.post('/agents', pa
 export const updateAgent = (id: string, payload: Partial<AgentPayload>) =>
   request.put(`/agents/${id}`, payload)
 
+export const deleteAgent = (id: string) => request.delete(`/agents/${id}`)
+
 export const listUserConversations = (params?: { agent_id?: string }) =>
   request.get('/conversations', { params })
+
+export const renameConversation = (id: string, payload: { title: string }) =>
+  request.patch(`/conversations/${id}`, payload)
+
+export const deleteConversation = (id: string) => request.delete(`/conversations/${id}`)

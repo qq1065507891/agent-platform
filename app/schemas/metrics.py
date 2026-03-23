@@ -6,8 +6,8 @@ from pydantic import BaseModel
 class MetricsSummary(BaseModel):
     p95_ms: float
     success_rate: float
-    token_day: int
-    agent_created_day: int
+    token_total: int
+    agent_created: int
 
 
 class MetricsErrorItem(BaseModel):

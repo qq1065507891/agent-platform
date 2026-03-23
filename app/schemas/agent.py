@@ -46,3 +46,6 @@ class AgentOut(BaseModel):
     is_public: bool = False
     status: str
     owner_id: str | None = None
+    owner_username: str | None = None
+    owner_email: str | None = None
+    created_at: str | None = None
