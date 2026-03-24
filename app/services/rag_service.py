@@ -7,6 +7,7 @@ from io import BytesIO
 from typing import Iterable
 import os
 from uuid import uuid4
+import logging
 
 from fastapi import UploadFile
 from langchain_community.vectorstores import Chroma
@@ -15,14 +16,53 @@ from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 from docx import Document as DocxDocument
+
+def _disable_chroma_telemetry() -> None:
+    # Force-disable Chroma/PostHog telemetry.
+    os.environ["ANONYMIZED_TELEMETRY"] = "False"
+    os.environ["CHROMA_TELEMETRY"] = "False"
+    os.environ["CHROMADB_ANONYMIZED_TELEMETRY"] = "False"
+    os.environ["POSTHOG_DISABLED"] = "true"
+
+    # CHROMA_PRODUCT_TELEMETRY_IMPL expects a fully-qualified class path.
+    # Remove misconfigured values (e.g. "none") that can crash client init.
+    if os.environ.get("CHROMA_PRODUCT_TELEMETRY_IMPL", "").strip().lower() == "none":
+        os.environ.pop("CHROMA_PRODUCT_TELEMETRY_IMPL", None)
+
+    # Chroma 0.5.23 + posthog>=6 can hit API signature mismatch:
+    # capture() takes 1 positional argument but 3 were given.
+    # Patch capture to a no-op to avoid log spam / side effects.
+    try:
+        import posthog  # type: ignore
+
+        posthog.disabled = True
+
+        def _noop_capture(*_args, **_kwargs):
+            return None
+
+        posthog.capture = _noop_capture  # type: ignore[attr-defined]
+    except Exception:
+        # Best-effort only; never block app startup.
+        pass
+
+
+_disable_chroma_telemetry()
+
 import chromadb
+from chromadb.config import Settings as ChromaSettings
+
+logger = logging.getLogger(__name__)
+logger.info(
+    "[chroma-telemetry] anonymized=%s chroma=%s chromadb=%s posthog_disabled=%s telemetry_impl=%s",
+    os.environ.get("ANONYMIZED_TELEMETRY"),
+    os.environ.get("CHROMA_TELEMETRY"),
+    os.environ.get("CHROMADB_ANONYMIZED_TELEMETRY"),
+    os.environ.get("POSTHOG_DISABLED"),
+    os.environ.get("CHROMA_PRODUCT_TELEMETRY_IMPL", "<unset>"),
+)
 
 from app.core.config import settings
 from app.services.embeddings import get_embeddings
-
-# Disable Chroma telemetry to avoid noisy posthog warnings in local/dev environments.
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
-os.environ.setdefault("CHROMA_TELEMETRY", "False")
 
 
 @dataclass
@@ -38,17 +78,22 @@ class RAGService:
         self._collection_name = "agent_knowledge"
 
     def _client(self) -> chromadb.ClientAPI:
+        chroma_settings = ChromaSettings(anonymized_telemetry=False)
         if settings.chroma_url:
-            return chromadb.HttpClient(host=settings.chroma_url)
+            return chromadb.HttpClient(host=settings.chroma_url, settings=chroma_settings)
         self._persist_path.mkdir(parents=True, exist_ok=True)
-        return chromadb.PersistentClient(path=str(self._persist_path))
+        return chromadb.PersistentClient(path=str(self._persist_path), settings=chroma_settings)
 
     def _embedding_function(self) -> Embeddings:
         return get_embeddings()
 
     def _vector_store(self) -> Chroma:
+        client = self._client()
+        # Let LangChain manage collection creation with our remote embedding function.
+        # Pre-creating collection here can trigger Chroma default embedding initialization
+        # in some versions, which may probe/download HuggingFace models locally.
         return Chroma(
-            client=self._client(),
+            client=client,
             collection_name=self._collection_name,
             embedding_function=self._embedding_function(),
         )

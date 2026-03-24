@@ -47,6 +47,15 @@ const messages = computed(() => conversation.value?.messages ?? [])
 const chatMessagesRef = ref<HTMLElement | null>(null)
 const streamAbortController = ref<AbortController | null>(null)
 const enableStreamMetrics = import.meta.env.VITE_ENABLE_STREAM_METRICS === 'true'
+const TRACE_KEY = 'x_request_id'
+
+const getRequestId = () => {
+  const existing = sessionStorage.getItem(TRACE_KEY)
+  if (existing) return existing
+  const created = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  sessionStorage.setItem(TRACE_KEY, created)
+  return created
+}
 const deletingConversationId = ref('')
 const renamingConversationId = ref('')
 const contextMenu = ref({
@@ -276,6 +285,7 @@ const sendMessage = async () => {
 
   try {
     const token = localStorage.getItem('access_token')
+    const requestId = getRequestId()
     const streamStartedAt = performance.now()
     let firstDeltaAt: number | null = null
     let deltaCount = 0
@@ -287,6 +297,8 @@ const sendMessage = async () => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'X-Request-Id': requestId,
+        'X-Trace-Id': requestId,
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify({ content, attachments: [] }),

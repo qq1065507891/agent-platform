@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import time
 from typing import Callable
 
@@ -10,17 +9,21 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 from app.core.database import SessionLocal
-from app.observability.context import generate_trace_id, set_trace_id, set_user_id
+from app.core.logging import get_logger
+from app.observability.context import generate_trace_id, set_request_id, set_trace_id, set_user_id
 from app.observability.service import ObservabilityService
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class TraceMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        incoming_trace_id = request.headers.get("X-Trace-Id") or request.headers.get("X-Request-Id")
+        incoming_request_id = request.headers.get("X-Request-Id")
+        incoming_trace_id = request.headers.get("X-Trace-Id") or incoming_request_id
         trace_id = incoming_trace_id or generate_trace_id()
+        request_id = incoming_request_id or trace_id
         set_trace_id(trace_id)
+        set_request_id(request_id)
 
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -38,7 +41,17 @@ class TraceMiddleware(BaseHTTPMiddleware):
             latency_ms = int((time.perf_counter() - start) * 1000)
             if response is not None:
                 response.headers["X-Trace-Id"] = trace_id
-                response.headers["X-Request-Id"] = trace_id
+                response.headers["X-Request-Id"] = request_id
+
+            logger.info(
+                "http_request",
+                method=request.method,
+                path=request.url.path,
+                status_code=status_code,
+                latency_ms=latency_ms,
+                client_ip=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+            )
 
             await run_in_threadpool(
                 self._write_request_log,
@@ -61,7 +74,7 @@ class TraceMiddleware(BaseHTTPMiddleware):
                 trace_id=trace_id,
             )
         except Exception as exc:
-            logger.warning("failed to persist request log: %s", exc)
+            logger.warning("observability_request_log_failed", error=str(exc))
             db.rollback()
         finally:
             db.close()

@@ -1,5 +1,15 @@
 import axios from 'axios'
 
+const TRACE_KEY = 'x_request_id'
+
+const getRequestId = () => {
+  const existing = sessionStorage.getItem(TRACE_KEY)
+  if (existing) return existing
+  const created = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  sessionStorage.setItem(TRACE_KEY, created)
+  return created
+}
+
 const request = axios.create({
   baseURL: '/api/v1',
   timeout: 30000,
@@ -7,8 +17,11 @@ const request = axios.create({
 
 request.interceptors.request.use((config) => {
   const token = localStorage.getItem('access_token')
+  const requestId = getRequestId()
+  config.headers = config.headers ?? {}
+  config.headers['X-Request-Id'] = requestId
+  config.headers['X-Trace-Id'] = requestId
   if (token) {
-    config.headers = config.headers ?? {}
     config.headers.Authorization = `Bearer ${token}`
   }
   return config

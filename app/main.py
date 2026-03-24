@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -12,17 +11,20 @@ from app.api import agents as agents_router
 from app.api import auth as auth_router
 from app.api import conversations as conversations_router
 from app.api import knowledge as knowledge_router
+from app.api import memory_ops as memory_ops_router
 from app.api import metrics as metrics_router
 from app.api import permissions as permissions_router
 from app.api import roles as roles_router
 from app.api import skills as skills_router
 from app.api import users as users_router
-from app.observability import TraceMiddleware, get_trace_id
+from app.core.logging import get_logger, setup_logging
+from app.observability.context import get_request_id, get_trace_id
+from app.observability.middleware import TraceMiddleware
 from app.schemas.common import ErrorDetail, ErrorResponse
 
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("agent-platform")
+setup_logging()
+logger = get_logger("agent-platform")
 
 app = FastAPI(title="Agent Platform API", version="v1")
 app.add_middleware(TraceMiddleware)
@@ -35,6 +37,7 @@ app.include_router(agents_router.router, prefix="/api/v1")
 app.include_router(conversations_router.router, prefix="/api/v1")
 app.include_router(skills_router.router, prefix="/api/v1")
 app.include_router(knowledge_router.router, prefix="/api/v1")
+app.include_router(memory_ops_router.router, prefix="/api/v1")
 app.include_router(metrics_router.router, prefix="/api/v1")
 
 
@@ -58,6 +61,12 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSONResponse:
     trace_id = get_trace_id()
+    request_id = get_request_id()
+    logger.warning(
+        "http_exception",
+        status_code=exc.status_code,
+        detail=str(exc.detail),
+    )
     payload = ErrorResponse(
         code=exc.status_code,
         message=exc.detail if isinstance(exc.detail, str) else "请求错误",
@@ -66,14 +75,16 @@ async def http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSO
     response = JSONResponse(status_code=exc.status_code, content=payload.model_dump())
     if trace_id:
         response.headers["X-Trace-Id"] = trace_id
-        response.headers["X-Request-Id"] = trace_id
+    if request_id:
+        response.headers["X-Request-Id"] = request_id
     return response
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(_: Request, exc: Exception) -> JSONResponse:
     trace_id = get_trace_id()
-    logger.exception("Unhandled exception", exc_info=exc)
+    request_id = get_request_id()
+    logger.exception("unhandled_exception", error_type=type(exc).__name__, error=str(exc), exc_info=exc)
     payload = ErrorResponse(
         code=5000,
         message="服务器内部错误",
@@ -82,5 +93,6 @@ async def global_exception_handler(_: Request, exc: Exception) -> JSONResponse:
     response = JSONResponse(status_code=500, content=payload.model_dump())
     if trace_id:
         response.headers["X-Trace-Id"] = trace_id
-        response.headers["X-Request-Id"] = trace_id
+    if request_id:
+        response.headers["X-Request-Id"] = request_id
     return response

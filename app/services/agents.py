@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.models.agent import Agent
 from app.observability.service import ObservabilityService
 from app.schemas.agent import AgentCreate, AgentUpdate
+from app.services.agent.graph import invalidate_agent_graph_cache
 
 
 class AgentService:
@@ -91,6 +92,7 @@ class AgentService:
         self.db.commit()
         self.db.refresh(agent)
         agent.skills = self._sanitize_skills(agent.skills)
+        invalidate_agent_graph_cache(agent.id)
         return agent
 
     def delete_agent(self, agent_id: str) -> None:

@@ -4,6 +4,7 @@ from contextvars import ContextVar
 from uuid import uuid4
 
 trace_id_var: ContextVar[str | None] = ContextVar("trace_id", default=None)
+request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 user_id_var: ContextVar[str | None] = ContextVar("user_id", default=None)
 agent_id_var: ContextVar[str | None] = ContextVar("agent_id", default=None)
 conversation_id_var: ContextVar[str | None] = ContextVar("conversation_id", default=None)
@@ -19,6 +20,14 @@ def set_trace_id(value: str | None) -> None:
 
 def get_trace_id() -> str | None:
     return trace_id_var.get()
+
+
+def set_request_id(value: str | None) -> None:
+    request_id_var.set(value)
+
+
+def get_request_id() -> str | None:
+    return request_id_var.get()
 
 
 def set_user_id(value: str | None) -> None:
