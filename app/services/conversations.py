@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import hashlib
 import json
 import logging
 import time
@@ -37,6 +38,11 @@ from app.tasks.memory_tasks import memory_writeback_task
 logger = logging.getLogger(__name__)
 
 MEMORY_VERSION = 1
+
+
+def _build_source_message_id(*, conversation_id: str, user_message: str, assistant_message: str) -> str:
+    payload = f"{conversation_id}|{user_message}|{assistant_message}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:36]
 
 
 def _should_prefer_direct_stream(content: str) -> bool:
@@ -210,6 +216,7 @@ class ConversationService:
         return history, langchain_messages, context_bundle
 
     def add_message(self, conversation: Conversation, payload: MessageCreate) -> dict[str, str]:
+        request_start = time.perf_counter()
         trace_id = get_trace_id() or generate_trace_id()
         history, langchain_messages, _context_bundle = self._prepare_messages(
             conversation,
@@ -238,6 +245,7 @@ class ConversationService:
         )
 
         selected_mode = str(mode_decision.get("mode") or "react")
+        retrieval_latency_ms = None
         if selected_mode == "router_worker":
             result = invoke_router_worker(
                 agent_id=conversation.agent_id,
@@ -245,6 +253,9 @@ class ConversationService:
                 context_bundle=_context_bundle,
                 user_query=payload.content,
             )
+            metrics = result.get("retrieval_metrics") if isinstance(result, dict) else None
+            if isinstance(metrics, dict):
+                retrieval_latency_ms = metrics.get("retrieval_latency_ms")
         else:
             graph = get_or_build_agent_graph(agent_id=conversation.agent_id)
             result = graph.invoke(
@@ -264,22 +275,37 @@ class ConversationService:
         else:
             updated_messages.append({"role": "assistant", "content": assistant_message})
 
-        memory_writeback_mode = "async" if getattr(settings, "memory_writeback_async_enabled", True) else "sync"
-        if memory_writeback_mode == "async":
-            memory_writeback_task.delay(
-                user_id=conversation.user_id,
-                agent_id=conversation.agent_id,
-                conversation_id=conversation.id,
-                trace_id=trace_id,
-                user_message=payload.content,
-                assistant_message=assistant_message,
-            )
-        else:
-            writeback_start = time.perf_counter()
-            writeback_status = "success"
-            accepted_count = 0
-            error_message = None
-            try:
+        memory_transactional = bool(getattr(settings, "memory_transactional_write_enabled", True))
+        memory_writeback_mode = (
+            "transactional"
+            if memory_transactional
+            else ("async" if getattr(settings, "memory_writeback_async_enabled", True) else "sync")
+        )
+        writeback_start = time.perf_counter()
+        writeback_status = "success"
+        accepted_count = 0
+        error_message = None
+        source_message_id = _build_source_message_id(
+            conversation_id=conversation.id,
+            user_message=payload.content,
+            assistant_message=assistant_message,
+        )
+        persist_before_done = memory_writeback_mode != "async"
+
+        try:
+            if memory_writeback_mode == "async":
+                conversation.messages = updated_messages
+                self.db.commit()
+                self.db.refresh(conversation)
+                memory_writeback_task.delay(
+                    user_id=conversation.user_id,
+                    agent_id=conversation.agent_id,
+                    conversation_id=conversation.id,
+                    trace_id=trace_id,
+                    user_message=payload.content,
+                    assistant_message=assistant_message,
+                )
+            else:
                 memory_service = get_memory_service()
                 write_candidates = memory_service.extract_write_candidates(payload.content, assistant_message)
                 accepted = memory_service.write_long_term_memories(
@@ -287,32 +313,49 @@ class ConversationService:
                     agent_id=conversation.agent_id,
                     conversation_id=conversation.id,
                     trace_id=trace_id,
+                    source_message_id=source_message_id,
                     candidates=write_candidates,
+                    db=self.db,
                 )
                 accepted_count = len(accepted)
-            except Exception as exc:
-                writeback_status = "failed"
-                error_message = str(exc)
-                logger.warning("sync memory writeback failed: %s", exc)
-            finally:
-                self.observability.log_event(
-                    event_type="memory_writeback",
-                    user_id=conversation.user_id,
-                    agent_id=conversation.agent_id,
-                    conversation_id=conversation.id,
-                    metadata={
-                        "trace_id": trace_id,
-                        "status": writeback_status,
-                        "latency_ms": int((time.perf_counter() - writeback_start) * 1000),
-                        "accepted_count": accepted_count,
-                        "error": error_message,
-                    },
-                )
+                conversation.messages = updated_messages
+                self.db.commit()
+                self.db.refresh(conversation)
+        except Exception as exc:
+            writeback_status = "failed"
+            error_message = str(exc)
+            self.db.rollback()
+            logger.warning("sync memory writeback failed: %s", exc)
+            raise RuntimeError("会话写入失败，请稍后重试") from exc
+        finally:
+            self.observability.log_event(
+                event_type="memory_writeback",
+                user_id=conversation.user_id,
+                agent_id=conversation.agent_id,
+                conversation_id=conversation.id,
+                metadata={
+                    "trace_id": trace_id,
+                    "status": writeback_status,
+                    "latency_ms": int((time.perf_counter() - writeback_start) * 1000),
+                    "accepted_count": accepted_count,
+                    "error": error_message,
+                    "source_message_id": source_message_id,
+                },
+            )
 
-        conversation.messages = updated_messages
-        self.db.commit()
-        self.db.refresh(conversation)
-
+        self.observability.log_event(
+            event_type="memory_stream_persist_consistency",
+            user_id=conversation.user_id,
+            agent_id=conversation.agent_id,
+            conversation_id=conversation.id,
+            metadata={
+                "trace_id": trace_id,
+                "persist_before_done": persist_before_done,
+                "memory_writeback_mode": memory_writeback_mode,
+                "source_message_id": source_message_id,
+            },
+        )
+        total_ms = int((time.perf_counter() - request_start) * 1000)
         self.observability.log_event(
             event_type="conversation_message_sent",
             user_id=conversation.user_id,
@@ -322,6 +365,9 @@ class ConversationService:
                 "trace_id": trace_id,
                 "message_length": len(payload.content),
                 "mode": "sync",
+                "path": selected_mode,
+                "retrieval_latency_ms": retrieval_latency_ms,
+                "llm_total_ms": total_ms,
                 "memory_writeback_mode": memory_writeback_mode,
             },
         )
@@ -358,6 +404,7 @@ class ConversationService:
         selected_mode = "react"
         used_direct_fallback = False
         stream_final_state: list | None = None
+        stream_metrics: dict | None = None
         graph_reason = "ok"
 
         agent = self.db.query(Agent).filter(Agent.id == conversation.agent_id).first()
@@ -409,7 +456,10 @@ class ConversationService:
                 elif event_type == "final":
                     if content and content != EMPTY_ASSISTANT_REPLY:
                         assembled = content
-                    if final_state:
+                    if isinstance(final_state, dict):
+                        stream_final_state = final_state.get("messages")
+                        stream_metrics = final_state.get("stream_metrics")
+                    elif final_state:
                         stream_final_state = final_state
         except Exception as exc:
             graph_reason = f"graph_exception:{type(exc).__name__}"
@@ -419,7 +469,7 @@ class ConversationService:
             graph_reason = f"{selected_mode}_no_usable_text"
             used_direct_fallback = True
             llm_path = f"{selected_mode}+direct_fallback"
-            for event_type, content, _ in stream_assistant_message_direct(langchain_messages):
+            for event_type, content, final_state in stream_assistant_message_direct(langchain_messages):
                 if event_type == "delta" and content:
                     got_delta = True
                     delta_count += 1
@@ -430,6 +480,8 @@ class ConversationService:
                     yield f"data: {json.dumps({'type': 'delta', 'content': content, 'server_ts_ms': server_ts_ms}, ensure_ascii=False)}\n\n"
                 elif event_type == "final" and content and content != EMPTY_ASSISTANT_REPLY:
                     assembled = content
+                    if isinstance(final_state, dict):
+                        stream_metrics = final_state.get("stream_metrics")
 
         if not assembled:
             assembled = "已收到你的消息，但当前没有生成文本回复。"
@@ -445,33 +497,59 @@ class ConversationService:
         else:
             updated_messages.append({"role": "assistant", "content": assembled})
 
-        memory_writeback_mode = "async" if getattr(settings, "memory_writeback_async_enabled", True) else "sync"
-        if memory_writeback_mode == "async":
-            memory_writeback_task.delay(
-                user_id=conversation.user_id,
-                agent_id=conversation.agent_id,
-                conversation_id=conversation.id,
-                trace_id=trace_id,
-                user_message=payload.content,
-                assistant_message=assembled,
-            )
-        else:
-            memory_service = get_memory_service()
-            write_candidates = memory_service.extract_write_candidates(payload.content, assembled)
-            memory_service.write_long_term_memories(
-                user_id=conversation.user_id,
-                agent_id=conversation.agent_id,
-                conversation_id=conversation.id,
-                trace_id=trace_id,
-                candidates=write_candidates,
-            )
+        memory_transactional = bool(getattr(settings, "memory_transactional_write_enabled", True))
+        memory_writeback_mode = (
+            "transactional"
+            if memory_transactional
+            else ("async" if getattr(settings, "memory_writeback_async_enabled", True) else "sync")
+        )
+        source_message_id = _build_source_message_id(
+            conversation_id=conversation.id,
+            user_message=payload.content,
+            assistant_message=assembled,
+        )
 
-        db_conversation = self.db.query(Conversation).filter(Conversation.id == conversation.id).first()
-        if db_conversation:
-            db_conversation.messages = updated_messages
-            self.db.commit()
+        try:
+            if memory_writeback_mode == "async":
+                db_conversation = self.db.query(Conversation).filter(Conversation.id == conversation.id).first()
+                if db_conversation:
+                    db_conversation.messages = updated_messages
+                    self.db.commit()
+                memory_writeback_task.delay(
+                    user_id=conversation.user_id,
+                    agent_id=conversation.agent_id,
+                    conversation_id=conversation.id,
+                    trace_id=trace_id,
+                    user_message=payload.content,
+                    assistant_message=assembled,
+                )
+            else:
+                memory_service = get_memory_service()
+                write_candidates = memory_service.extract_write_candidates(payload.content, assembled)
+                memory_service.write_long_term_memories(
+                    user_id=conversation.user_id,
+                    agent_id=conversation.agent_id,
+                    conversation_id=conversation.id,
+                    trace_id=trace_id,
+                    source_message_id=source_message_id,
+                    candidates=write_candidates,
+                    db=self.db,
+                )
+                db_conversation = self.db.query(Conversation).filter(Conversation.id == conversation.id).first()
+                if db_conversation:
+                    db_conversation.messages = updated_messages
+                    self.db.commit()
+        except Exception as exc:
+            self.db.rollback()
+            logger.warning("stream memory transactional persist failed: %s", exc)
+            raise RuntimeError("流式会话持久化失败，请稍后重试") from exc
 
-        if not stream_use_long_term and bool(getattr(settings, "memory_long_term_prefetch_enabled", True)):
+        # 降低在线请求尾部抖动：stream 路径默认关闭响应后 prefetch 调度。
+        if (
+            bool(getattr(settings, "memory_stream_prefetch_after_response_enabled", False))
+            and not stream_use_long_term
+            and bool(getattr(settings, "memory_long_term_prefetch_enabled", True))
+        ):
             try:
                 get_memory_service().prefetch_long_term_memories(
                     user_id=conversation.user_id,
@@ -483,19 +561,46 @@ class ConversationService:
                 logger.warning("memory prefetch schedule failed: %s", exc)
 
         total_ms = int((time.perf_counter() - request_start) * 1000)
+        unified_delta_count = delta_count
+        unified_first_delta_ms = first_delta_ms
+        unified_total_ms = total_ms
+        unified_fallback = used_direct_fallback
+        unified_raw_event_count = None
+        unified_event_count = None
+        unified_end_state = None
+        unified_fallback_reason = None
+
+        if isinstance(stream_metrics, dict):
+            unified_delta_count = int(stream_metrics.get("delta_text_count", unified_delta_count) or unified_delta_count)
+            unified_first_delta_ms = stream_metrics.get("first_delta_ms", unified_first_delta_ms)
+            unified_total_ms = int(stream_metrics.get("total_ms", unified_total_ms) or unified_total_ms)
+            unified_fallback = bool(stream_metrics.get("fallback_triggered", unified_fallback))
+            unified_raw_event_count = stream_metrics.get("raw_event_count")
+            unified_event_count = stream_metrics.get("unified_event_count")
+            unified_end_state = stream_metrics.get("end_state")
+            unified_fallback_reason = stream_metrics.get("fallback_reason")
+
+        retrieval_latency_ms = None
+        if isinstance(stream_metrics, dict):
+            retrieval_latency_ms = stream_metrics.get("retrieval_latency_ms")
+
         logger.info(
-            "[stream-summary] trace_id=%s path=%s graph_reason=%s direct_fallback=%s memory_writeback_mode=%s history_len=%s input_len=%s delta_count=%s first_delta_ms=%s total_ms=%s output_len=%s context_budget=%s",
+            "[stream-summary] trace_id=%s path=%s graph_reason=%s direct_fallback=%s memory_writeback_mode=%s history_len=%s input_len=%s delta_count=%s first_delta_ms=%s total_ms=%s output_len=%s raw_event_count=%s unified_event_count=%s end_state=%s fallback_reason=%s context_budget=%s",
             trace_id,
             llm_path,
             graph_reason,
-            used_direct_fallback,
+            unified_fallback,
             memory_writeback_mode,
             len(history),
             len(payload.content or ""),
-            delta_count,
-            first_delta_ms,
-            total_ms,
+            unified_delta_count,
+            unified_first_delta_ms,
+            unified_total_ms,
             len(assembled),
+            unified_raw_event_count,
+            unified_event_count,
+            unified_end_state,
+            unified_fallback_reason,
             context_bundle.get("budget", {}),
         )
 
@@ -508,6 +613,9 @@ class ConversationService:
                 "trace_id": trace_id,
                 "message_length": len(payload.content),
                 "mode": "stream",
+                "path": llm_path,
+                "retrieval_latency_ms": retrieval_latency_ms,
+                "llm_total_ms": unified_total_ms,
                 "memory_writeback_mode": memory_writeback_mode,
             },
         )

@@ -4,28 +4,49 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 import json
+import logging
+import time
 
-from langchain_core.messages import AIMessage, AIMessageChunk, AnyMessage, SystemMessage
+from langchain_core.messages import AIMessage, AnyMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
+from app.core.database import SessionLocal
+from app.observability.context import get_agent_id, get_conversation_id, get_trace_id, get_user_id
+from app.observability.service import ObservabilityService
 from app.services.rag_service import get_rag_service
+from app.services.streaming import (
+    StreamAssembler,
+    extract_text_content,
+    iter_public_stream_events,
+    iter_unified_events_from_llm_stream,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+def _log_worker_event(event_type: str, metadata: dict[str, Any]) -> None:
+    db = SessionLocal()
+    try:
+        ObservabilityService(db).log_event(
+            event_type=event_type,
+            metadata=metadata,
+            trace_id=get_trace_id(),
+            user_id=get_user_id(),
+            agent_id=get_agent_id(),
+            conversation_id=get_conversation_id(),
+        )
+    except Exception as exc:
+        logger.warning("failed to persist router worker event: %s", exc)
+        db.rollback()
+    finally:
+        db.close()
 
 
 def _extract_text_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-            elif isinstance(item, str):
-                parts.append(item)
-        return "".join(parts)
-    return ""
+    # Keep local function for backward compatibility in this module.
+    return extract_text_content(content)
 
 
 def _load_llm(*, streaming: bool = True) -> ChatOpenAI:
@@ -131,19 +152,42 @@ def _run_workers(*, worker_names: list[str], agent_id: str | None, user_query: s
     outputs: dict[str, str] = {}
 
     with ThreadPoolExecutor(max_workers=max(1, len(worker_names))) as executor:
-        futures = {}
+        futures: dict[Any, tuple[str, float]] = {}
         for name in worker_names:
+            started_at = time.perf_counter()
             if name == "memory":
-                futures[executor.submit(_memory_worker, context_bundle)] = name
+                futures[executor.submit(_memory_worker, context_bundle)] = (name, started_at)
             elif name == "knowledge":
-                futures[executor.submit(_knowledge_worker, agent_id, user_query)] = name
+                futures[executor.submit(_knowledge_worker, agent_id, user_query)] = (name, started_at)
 
         for future in as_completed(futures):
-            worker_name = futures[future]
+            worker_name, started_at = futures[future]
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
             try:
-                outputs[worker_name] = str(future.result() or "")
+                value = str(future.result() or "")
+                outputs[worker_name] = value
+                _log_worker_event(
+                    event_type="router_worker_trace",
+                    metadata={
+                        "worker_name": worker_name,
+                        "worker_latency_ms": latency_ms,
+                        "worker_success": True,
+                        "error_type": None,
+                        "fallback_reason": "knowledge_miss" if worker_name == "knowledge" and "未命中" in value else None,
+                    },
+                )
             except Exception as exc:
                 outputs[worker_name] = f"(worker_error:{type(exc).__name__})"
+                _log_worker_event(
+                    event_type="router_worker_trace",
+                    metadata={
+                        "worker_name": worker_name,
+                        "worker_latency_ms": latency_ms,
+                        "worker_success": False,
+                        "error_type": type(exc).__name__,
+                        "fallback_reason": "worker_exception",
+                    },
+                )
 
     return outputs
 
@@ -171,6 +215,7 @@ def invoke_router_worker(
     context_bundle: dict[str, Any],
     user_query: str,
 ) -> dict[str, Any]:
+    total_start = time.perf_counter()
     worker_names = _route_workers(user_query)
     worker_outputs = _run_workers(
         worker_names=worker_names,
@@ -187,8 +232,27 @@ def invoke_router_worker(
     )
     response = llm.invoke([router_context, *messages])
     content = _extract_text_content(response.content)
+    _log_worker_event(
+        event_type="retrieval_trace",
+        metadata={
+            "source": "router_worker",
+            "query_len": len(user_query or ""),
+            "recall_k": int(getattr(settings, "rag_recall_k", 24)),
+            "returned_k": 1 if content else 0,
+            "latency_retrieve_ms": int((time.perf_counter() - total_start) * 1000),
+            "fallback_reason": None if content else "empty_router_output",
+            "workers": worker_names,
+        },
+    )
     final_ai = AIMessage(content=content or "")
-    return {"messages": [*messages, final_ai]}
+    return {
+        "messages": [*messages, final_ai],
+        "retrieval_metrics": {
+            "retrieval_latency_ms": int((time.perf_counter() - total_start) * 1000),
+            "path": "router_worker",
+            "fallback_reason": None if content else "empty_router_output",
+        },
+    }
 
 
 def stream_router_worker(
@@ -198,6 +262,7 @@ def stream_router_worker(
     context_bundle: dict[str, Any],
     user_query: str,
 ) -> Iterator[tuple[str, str, list[AnyMessage] | None]]:
+    total_start = time.perf_counter()
     worker_names = _route_workers(user_query)
     worker_outputs = _run_workers(
         worker_names=worker_names,
@@ -213,16 +278,33 @@ def stream_router_worker(
         context_bundle=context_bundle,
     )
 
-    assembled = ""
+    assembler = StreamAssembler()
     for chunk in llm.stream([router_context, *messages]):
-        if isinstance(chunk, AIMessageChunk):
-            text = _extract_text_content(chunk.content)
-            if text:
-                assembled += text
-                yield ("delta", text, None)
+        assembler.metrics.raw_event_count += 1
+        for ue in iter_unified_events_from_llm_stream([chunk]):
+            assembler.consume(ue)
+            for public_event, payload in iter_public_stream_events(ue):
+                yield (public_event, payload, None)
+
+    assembled, metrics = assembler.finalize()
+    retrieval_latency_ms = int((time.perf_counter() - total_start) * 1000)
+    metrics["retrieval_latency_ms"] = retrieval_latency_ms
+    metrics["path"] = "router_worker"
+    _log_worker_event(
+        event_type="retrieval_trace",
+        metadata={
+            "source": "router_worker_stream",
+            "query_len": len(user_query or ""),
+            "recall_k": int(getattr(settings, "rag_recall_k", 24)),
+            "returned_k": 1 if assembled.strip() else 0,
+            "latency_retrieve_ms": int((time.perf_counter() - total_start) * 1000),
+            "fallback_reason": None if assembled.strip() else "empty_router_output",
+            "workers": worker_names,
+        },
+    )
 
     if assembled.strip():
         final_state: list[AnyMessage] = [*messages, AIMessage(content=assembled)]
-        yield ("final", assembled, final_state)
+        yield ("final", assembled, {"messages": final_state, "stream_metrics": metrics})
     else:
-        yield ("final", "", None)
+        yield ("final", "", {"messages": None, "stream_metrics": metrics})

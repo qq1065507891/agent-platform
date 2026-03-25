@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Iterator, TypedDict
+from dataclasses import asdict
 from typing_extensions import Annotated
 import json
 import logging
@@ -22,6 +23,13 @@ from app.services.rag_service import get_rag_service
 from app.services.sandbox import SandboxSecurityError, SandboxTimeoutError, execute_skill_code_safely
 from app.services.skills.builtin import BUILTIN_TOOLS
 from app.services.skills.service import SkillService
+from app.services.streaming import (
+    StreamAssembler,
+    extract_text_content,
+    iter_public_stream_events,
+    iter_unified_events_from_graph_event,
+    iter_unified_events_from_llm_stream,
+)
 
 EMPTY_ASSISTANT_REPLY = "已收到你的消息，但当前没有生成文本回复。"
 
@@ -365,14 +373,38 @@ def build_agent_graph(agent_id: str | None = None) -> Any:
     @tool
     def retriever_tool(query: str) -> str:
         """检索内部知识库，返回与问题最相关的片段。"""
+        start = time.perf_counter()
+        recall_k = int(getattr(settings, "rag_recall_k", 24))
         try:
             retriever = rag_service.as_retriever(agent_id=agent_id)
             docs = retriever.invoke(query)
+            _log_react_loop_event(
+                event_type="retrieval_trace",
+                metadata={
+                    "query_len": len(query or ""),
+                    "recall_k": recall_k,
+                    "returned_k": len(docs or []),
+                    "latency_retrieve_ms": int((time.perf_counter() - start) * 1000),
+                    "fallback_reason": None,
+                    "source": "graph_retriever_tool",
+                },
+            )
             if not docs:
                 return "知识库暂无匹配内容。"
             return rag_service.format_docs(docs)
-        except Exception:
-            return "知识库检索暂时不可用，请基于通用知识回答并提示用户稍后重试。"
+        except Exception as exc:
+            _log_react_loop_event(
+                event_type="retrieval_trace",
+                metadata={
+                    "query_len": len(query or ""),
+                    "recall_k": recall_k,
+                    "returned_k": 0,
+                    "latency_retrieve_ms": int((time.perf_counter() - start) * 1000),
+                    "fallback_reason": f"{type(exc).__name__}",
+                    "source": "graph_retriever_tool",
+                },
+            )
+            return "知识库检索暂时不可用，请稍后重试。"
 
     dynamic_tools = _build_external_skill_tools(agent_id)
     tools = [*list(BUILTIN_TOOLS.values()), retriever_tool, *dynamic_tools]
@@ -588,13 +620,9 @@ def stream_assistant_message(
     graph: Any,
     input_state: dict[str, Any] | list[AnyMessage],
 ) -> Iterator[tuple[str, str, list[AnyMessage] | None]]:
-    """通过 graph 的 messages 模式转发 token/chunk。"""
+    """通过统一协议适配 graph stream 并转发 SSE 事件。"""
     app_env = getattr(settings, "app_env", "development")
     debug_stream = str(app_env).lower() != "production"
-    assembled = ""
-    chunk_count = 0
-    stream_start = time.perf_counter()
-    first_chunk_at_ms: int | None = None
 
     state_input: dict[str, Any]
     if isinstance(input_state, dict):
@@ -602,174 +630,53 @@ def stream_assistant_message(
     else:
         state_input = {"messages": input_state}
 
-    llm_call_count = 0
     if debug_stream:
         logger.info("[stream-debug] start stream(messages), history_len=%s", len(state_input.get("messages", [])))
 
+    assembler = StreamAssembler()
     final_state_messages: list[AnyMessage] | None = None
-    debug_event_count = 0
 
-    for event in graph.stream(state_input, stream_mode=["messages", "values"]):
-        mode: str | None = None
-        item: Any = event
-        if isinstance(event, tuple) and len(event) == 2 and isinstance(event[0], str):
-            mode = event[0]
-            item = event[1]
+    for raw_event in graph.stream(state_input, stream_mode=["messages", "values"]):
+        assembler.metrics.raw_event_count += 1
+        for ue in iter_unified_events_from_graph_event(raw_event):
+            assembler.consume(ue)
+            for public_event, payload in iter_public_stream_events(ue):
+                yield (public_event, payload, None)
 
-        debug_event_count += 1
-        if debug_stream and debug_event_count <= 8:
-            logger.info(
-                "[stream-debug] graph event #%s mode=%s raw_type=%s raw_preview=%s",
-                debug_event_count,
-                mode,
-                type(item).__name__,
-                _safe_json(item, max_len=360),
-            )
-
-        # LangGraph 在部分版本/stream_mode 组合下会返回 AddableUpdatesDict：
-        # {"react": {"messages": [...]}, "tool": {...}}，而非 ("messages", item) 元组。
-        # 这种情况下手动提取 messages，避免误判为空流。
-        if mode is None and isinstance(item, dict):
-            extracted_any = False
-            for node_name, node_update in item.items():
-                if isinstance(node_update, dict):
-                    if node_name in {"react", "tool", "planner", "finalizer"}:
-                        llm_call_count = max(llm_call_count, 1)
-                    node_messages = node_update.get("messages")
-                    if not isinstance(node_messages, list):
-                        continue
-
-                    for raw_msg in node_messages:
-                        msg_obj = raw_msg
-                        # 兼容消息对象 / 字符串化对象 / 原始 content
-                        text = _extract_text_content(getattr(msg_obj, "content", msg_obj))
-                        if not text:
-                            continue
-
-                        extracted_any = True
-                        chunk_count += 1
-                        assembled += text
-                        if first_chunk_at_ms is None:
-                            first_chunk_at_ms = int((time.perf_counter() - stream_start) * 1000)
-                            if debug_stream:
-                                logger.info("[stream-debug] graph ttft_ms=%s", first_chunk_at_ms)
-                        if debug_stream:
-                            logger.info(
-                                "[stream-debug] graph update_message node=%s text=%r msg_type=%s",
-                                node_name,
-                                text,
-                                type(msg_obj).__name__,
-                            )
-                        yield ("delta", text, None)
-
-            if extracted_any:
-                continue
-
-        if mode in (None, "messages"):
-            if isinstance(item, tuple) and len(item) == 2:
-                meta = item[1]
-                if isinstance(meta, dict):
-                    # 保留历史统计字段兼容
-                    if meta.get("langgraph_node") in {"planner", "finalizer"}:
-                        llm_call_count = max(llm_call_count, 1 if meta.get("langgraph_node") == "planner" else 2)
-                    # 新图节点名（react/tool 等）统一也计入调用观测
-                    if meta.get("langgraph_node") in {"react", "tool"}:
-                        llm_call_count = max(llm_call_count, 1)
-            msg = item[0] if isinstance(item, tuple) else item
-
-            if isinstance(msg, AIMessageChunk):
-                chunk_count += 1
-                text = _extract_text_content(msg.content)
-                if debug_stream:
-                    logger.info(
-                        "[stream-debug] graph chunk #%s text=%r content=%s tool_calls=%s additional_kwargs=%s response_metadata=%s",
-                        chunk_count,
-                        text,
-                        _safe_json(getattr(msg, "content", None)),
-                        _safe_json(getattr(msg, "tool_calls", None)),
-                        _safe_json(getattr(msg, "additional_kwargs", None)),
-                        _safe_json(getattr(msg, "response_metadata", None)),
-                    )
-                if text:
-                    assembled += text
-                    if first_chunk_at_ms is None:
-                        first_chunk_at_ms = int((time.perf_counter() - stream_start) * 1000)
-                        if debug_stream:
-                            logger.info("[stream-debug] graph ttft_ms=%s", first_chunk_at_ms)
-                    yield ("delta", text, None)
-                continue
-
-            if isinstance(msg, AIMessage):
-                text = _extract_text_content(msg.content)
-                if debug_stream:
-                    logger.info("[stream-debug] graph ai_message text=%r", text)
-                if text:
-                    assembled = text
-                    if first_chunk_at_ms is None:
-                        first_chunk_at_ms = int((time.perf_counter() - stream_start) * 1000)
-                    # 兼容只返回完整消息、不返回 chunk 的供应商
-                    yield ("delta", text, None)
-                continue
-
-            # 兜底：只要是消息对象且含 content，都尝试提取文本
-            generic_content = getattr(msg, "content", None)
-            generic_text = _extract_text_content(generic_content)
-            if generic_text:
-                chunk_count += 1
-                assembled += generic_text
-                if first_chunk_at_ms is None:
-                    first_chunk_at_ms = int((time.perf_counter() - stream_start) * 1000)
-                if debug_stream:
-                    logger.info("[stream-debug] graph generic_message text=%r type=%s", generic_text, type(msg).__name__)
-                yield ("delta", generic_text, None)
-            continue
-
-        if mode == "values" and isinstance(item, dict):
-            state_messages = item.get("messages")
-            if isinstance(state_messages, list):
-                final_state_messages = state_messages
-
-    if final_state_messages:
-        for msg in reversed(final_state_messages):
-            if isinstance(msg, AIMessage):
-                text = _extract_text_content(msg.content)
-                if text and text.strip():
-                    assembled = text
-                break
+    assembled, metrics = assembler.finalize()
 
     if assembled and assembled.strip() and assembled.strip() != EMPTY_ASSISTANT_REPLY:
         if debug_stream:
-            total_ms = int((time.perf_counter() - stream_start) * 1000)
             logger.info(
-                "[stream-debug] end by graph stream, llm_call_count=%s chunk_count=%s assembled_len=%s ttft_ms=%s total_ms=%s",
-                llm_call_count,
-                chunk_count,
-                len(assembled),
-                first_chunk_at_ms,
-                total_ms,
+                "[stream-debug] end by graph stream, raw_event_count=%s unified_event_count=%s delta_text_count=%s first_delta_ms=%s total_ms=%s",
+                metrics.raw_event_count,
+                metrics.unified_event_count,
+                metrics.delta_text_count,
+                metrics.first_delta_ms,
+                metrics.total_ms,
             )
-        yield ("final", assembled, final_state_messages)
+        yield ("final", assembled, {"messages": final_state_messages, "stream_metrics": asdict(metrics)})
         return
 
-    # graph 流为空时，先尝试 graph 非流式兜底（保留 tools/RAG 行为），再退化为纯 LLM 兜底。
+    # graph 流为空时，按配置决定是否先走 graph.invoke 兜底（可关闭以降低长尾延迟），再退化为纯 LLM 兜底。
     non_stream_text = ""
     fallback_timeout_seconds = float(getattr(settings, "llm_fallback_timeout_seconds", 20.0))
 
-    graph_invoke_start = time.perf_counter()
-    try:
-        invoke_result = graph.invoke(state_input)
-        invoke_messages = invoke_result.get("messages") if isinstance(invoke_result, dict) else None
-        if isinstance(invoke_messages, list) and invoke_messages:
-            non_stream_text = extract_assistant_message(invoke_messages)
-            if invoke_messages:
+    if bool(getattr(settings, "stream_graph_invoke_fallback_enabled", False)):
+        graph_invoke_start = time.perf_counter()
+        try:
+            invoke_result = graph.invoke(state_input)
+            invoke_messages = invoke_result.get("messages") if isinstance(invoke_result, dict) else None
+            if isinstance(invoke_messages, list) and invoke_messages:
+                non_stream_text = extract_assistant_message(invoke_messages)
                 final_state_messages = invoke_messages
-    except Exception as exc:
-        if debug_stream:
-            logger.warning("[stream-debug] graph invoke fallback failed: %s", exc)
-    finally:
-        if debug_stream:
-            graph_invoke_ms = int((time.perf_counter() - graph_invoke_start) * 1000)
-            logger.info("[stream-debug] graph invoke fallback latency_ms=%s", graph_invoke_ms)
+        except Exception as exc:
+            if debug_stream:
+                logger.warning("[stream-debug] graph invoke fallback failed: %s", exc)
+        finally:
+            if debug_stream:
+                graph_invoke_ms = int((time.perf_counter() - graph_invoke_start) * 1000)
+                logger.info("[stream-debug] graph invoke fallback latency_ms=%s", graph_invoke_ms)
 
     if (not non_stream_text or not non_stream_text.strip()):
         llm_fallback_start = time.perf_counter()
@@ -795,7 +702,10 @@ def stream_assistant_message(
     if non_stream_text and non_stream_text.strip() and non_stream_text.strip() != EMPTY_ASSISTANT_REPLY:
         if debug_stream:
             logger.info("[stream-debug] graph non-stream fallback succeeded, output_len=%s", len(non_stream_text))
-        yield ("final", non_stream_text, final_state_messages)
+        fallback_metrics = assembler.metrics
+        fallback_metrics.fallback_triggered = True
+        fallback_metrics.fallback_reason = "graph_stream_empty"
+        yield ("final", non_stream_text, {"messages": final_state_messages, "stream_metrics": asdict(fallback_metrics)})
         return
 
     if debug_stream:
@@ -833,47 +743,31 @@ def stream_assistant_message_direct(messages: list[AnyMessage]) -> Iterator[tupl
     debug_stream = str(app_env).lower() != "production"
 
     llm = _load_llm()
-    assembled = ""
-    chunk_count = 0
-    stream_start = time.perf_counter()
-    first_chunk_at_ms: int | None = None
+    assembler = StreamAssembler()
 
     if debug_stream:
         logger.info("[stream-debug] start direct llm stream, history_len=%s", len(messages))
 
-    for msg in llm.stream(messages):
-        if isinstance(msg, AIMessageChunk):
-            chunk_count += 1
-            text = _extract_text_content(msg.content)
-            if debug_stream:
-                logger.info(
-                    "[stream-debug] direct chunk #%s text=%r content=%s tool_calls=%s additional_kwargs=%s response_metadata=%s",
-                    chunk_count,
-                    text,
-                    _safe_json(getattr(msg, "content", None)),
-                    _safe_json(getattr(msg, "tool_calls", None)),
-                    _safe_json(getattr(msg, "additional_kwargs", None)),
-                    _safe_json(getattr(msg, "response_metadata", None)),
-                )
-            if text:
-                assembled += text
-                if first_chunk_at_ms is None:
-                    first_chunk_at_ms = int((time.perf_counter() - stream_start) * 1000)
-                    if debug_stream:
-                        logger.info("[stream-debug] direct ttft_ms=%s", first_chunk_at_ms)
-                yield ("delta", text, None)
+    for raw_item in llm.stream(messages):
+        assembler.metrics.raw_event_count += 1
+        for ue in iter_unified_events_from_llm_stream([raw_item]):
+            assembler.consume(ue)
+            for public_event, payload in iter_public_stream_events(ue):
+                yield (public_event, payload, None)
+
+    assembled, metrics = assembler.finalize()
 
     if assembled and assembled.strip() and assembled.strip() != EMPTY_ASSISTANT_REPLY:
         if debug_stream:
-            total_ms = int((time.perf_counter() - stream_start) * 1000)
             logger.info(
-                "[stream-debug] end by direct stream, chunk_count=%s assembled_len=%s ttft_ms=%s total_ms=%s",
-                chunk_count,
-                len(assembled),
-                first_chunk_at_ms,
-                total_ms,
+                "[stream-debug] end by direct stream, raw_event_count=%s unified_event_count=%s delta_text_count=%s first_delta_ms=%s total_ms=%s",
+                metrics.raw_event_count,
+                metrics.unified_event_count,
+                metrics.delta_text_count,
+                metrics.first_delta_ms,
+                metrics.total_ms,
             )
-        yield ("final", assembled, None)
+        yield ("final", assembled, {"messages": None, "stream_metrics": asdict(metrics)})
         return
 
     # 流式为空时尝试非流式兜底，避免供应商 chunk 兼容问题导致空回复。
