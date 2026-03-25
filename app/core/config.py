@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_timeout_seconds: float = 45.0
     llm_fallback_timeout_seconds: float = 20.0
+    stream_protocol_version: str = "v1"
+    stream_meta_event_enabled: bool = True
+    stream_fallback_on_empty_enabled: bool = True
+    stream_debug_raw_event_limit: int = 8
+    stream_graph_invoke_fallback_enabled: bool = False
+    stream_graph_invoke_fallback_timeout_seconds: float = 1.2
 
     # Embedding endpoint can be configured independently (e.g. ModelScope OpenAI-compatible API)
     llm_embedding_base_url: str = ""
@@ -30,9 +36,21 @@ class Settings(BaseSettings):
     llm_embedding: str = ""
     llm_embedding_model: str = "text-embedding-3-small"
     llm_embedding_timeout_seconds: float = 12.0
+    llm_embedding_dimensions: int = 1024
 
     chroma_url: str = ""
     chroma_persist_path: str = "./chroma"
+
+    rag_chunk_size: int = 800
+    rag_chunk_overlap: int = 120
+    rag_recall_k: int = 24
+    rag_final_k: int = 6
+    rag_sparse_k: int = 12
+    rag_hybrid_enabled: bool = False
+    rag_rerank_enabled: bool = False
+    rag_rerank_timeout_ms: int = 300
+    rag_context_budget_tokens: int = 2200
+    rag_ingest_dedup_enabled: bool = True
 
     redis_url: str = "redis://127.0.0.1:6379/0"
     celery_broker_url: str = "redis://127.0.0.1:6379/1"
@@ -58,6 +76,7 @@ class Settings(BaseSettings):
     # Two-stage enhancement: allow async prefetch for next-turn context quality.
     memory_long_term_prefetch_enabled: bool = True
     memory_long_term_prefetch_ttl_seconds: int = 120
+    memory_stream_prefetch_after_response_enabled: bool = False
     memory_summary_enabled: bool = True
     memory_summary_max_chars: int = 1500
     memory_prompt_summary_max_chars: int = 1000
@@ -66,6 +85,8 @@ class Settings(BaseSettings):
     memory_prompt_long_memory_item_max_chars: int = 220
     memory_writeback_enabled: bool = True
     memory_writeback_async_enabled: bool = True
+    memory_transactional_write_enabled: bool = True
+    memory_backend: str = "pgvector"
     memory_writeback_similarity_threshold: float = 0.92
     memory_writeback_min_confidence: float = 0.7
     memory_extraction_use_llm: bool = True
@@ -76,6 +97,8 @@ class Settings(BaseSettings):
     memory_default_ttl_seconds: int = 0
     memory_sla_retrieval_p95_ms: int = 800
     memory_sla_retrieval_p99_ms: int = 800
+    memory_vector_recall_enabled: bool = True
+    memory_vector_recall_timeout_seconds: float = 1.2
     memory_sla_ingest_5s_rate: float = 0.95
     memory_sla_ingest_10s_rate: float = 0.99
     memory_sla_writeback_success_rate: float = 0.98
