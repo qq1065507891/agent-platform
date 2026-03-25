@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 from typing import Iterable
+import hashlib
 import os
 from uuid import uuid4
 import logging
@@ -70,6 +71,7 @@ class IngestResult:
     doc_id: str
     version: int
     chunk_count: int
+    ingest_status: str = "indexed"
 
 
 class RAGService:
@@ -99,7 +101,10 @@ class RAGService:
         )
 
     def _split_text(self, text: str) -> list[str]:
-        splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=int(getattr(settings, "rag_chunk_size", 800)),
+            chunk_overlap=int(getattr(settings, "rag_chunk_overlap", 120)),
+        )
         return splitter.split_text(text)
 
     def _extract_text_from_pdf(self, data: bytes) -> str:
@@ -118,27 +123,77 @@ class RAGService:
             return self._extract_text_from_docx(data)
         return data.decode("utf-8", errors="ignore")
 
-    def _build_documents(self, chunks: Iterable[str], doc_id: str, source_name: str) -> list[Document]:
+    def _infer_doc_type(self, filename: str) -> str:
+        suffix = Path(filename or "uploaded").suffix.lower()
+        return suffix.lstrip(".") or "txt"
+
+    def _compute_content_hash(self, data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    def _estimate_tokens(self, text: str) -> int:
+        return max(1, len(text) // 4)
+
+    def _exists_by_hash(self, *, content_hash: str, agent_id: str | None = None) -> bool:
+        store = self._vector_store()
+        try:
+            filter_payload: dict[str, str] = {"content_hash": content_hash}
+            if agent_id:
+                filter_payload["agent_id"] = agent_id
+            result = store._collection.get(where=filter_payload, limit=1, include=["metadatas"])
+            ids = result.get("ids", []) if isinstance(result, dict) else []
+            return bool(ids)
+        except Exception:
+            return False
+
+    def _build_documents(
+        self,
+        chunks: Iterable[str],
+        doc_id: str,
+        source_name: str,
+        *,
+        doc_type: str,
+        content_hash: str,
+    ) -> list[Document]:
         timestamp = datetime.utcnow().isoformat()
-        return [
-            Document(
-                page_content=chunk,
-                metadata={
-                    "doc_id": doc_id,
-                    "source": source_name,
-                    "created_at": timestamp,
-                },
+        built_documents: list[Document] = []
+        for index, chunk in enumerate(chunks):
+            built_documents.append(
+                Document(
+                    page_content=chunk,
+                    metadata={
+                        "doc_id": doc_id,
+                        "source": source_name,
+                        "created_at": timestamp,
+                        "chunk_index": index,
+                        "doc_type": doc_type,
+                        "token_estimate": self._estimate_tokens(chunk),
+                        "content_hash": content_hash,
+                    },
+                )
             )
-            for chunk in chunks
-        ]
+        return built_documents
 
     async def ingest_upload(self, file: UploadFile, agent_id: str | None = None) -> IngestResult:
         data = await file.read()
         doc_id = f"doc-{uuid4().hex}"
         version = 1
-        content = self._extract_text(file.filename or "uploaded", data)
+        filename = file.filename or "uploaded"
+        doc_type = self._infer_doc_type(filename)
+        content_hash = self._compute_content_hash(data)
+
+        dedup_enabled = bool(getattr(settings, "rag_ingest_dedup_enabled", True))
+        if dedup_enabled and self._exists_by_hash(content_hash=content_hash, agent_id=agent_id):
+            return IngestResult(doc_id=doc_id, version=version, chunk_count=0, ingest_status="deduplicated")
+
+        content = self._extract_text(filename, data)
         chunks = [chunk.strip() for chunk in self._split_text(content) if chunk.strip()]
-        documents = self._build_documents(chunks, doc_id, file.filename or "uploaded")
+        documents = self._build_documents(
+            chunks,
+            doc_id,
+            filename,
+            doc_type=doc_type,
+            content_hash=content_hash,
+        )
         if agent_id:
             for doc in documents:
                 doc.metadata["agent_id"] = agent_id
@@ -147,17 +202,18 @@ class RAGService:
             doc.metadata["status"] = "indexed"
 
         if not documents:
-            return IngestResult(doc_id=doc_id, version=version, chunk_count=0)
+            return IngestResult(doc_id=doc_id, version=version, chunk_count=0, ingest_status="empty")
 
         store = self._vector_store()
         store.add_documents(documents)
-        return IngestResult(doc_id=doc_id, version=version, chunk_count=len(documents))
+        return IngestResult(doc_id=doc_id, version=version, chunk_count=len(documents), ingest_status="indexed")
 
     def as_retriever(self, agent_id: str | None = None):
         store = self._vector_store()
+        recall_k = int(getattr(settings, "rag_recall_k", 24))
         if agent_id:
-            return store.as_retriever(search_kwargs={"k": 4, "filter": {"agent_id": agent_id}})
-        return store.as_retriever(search_kwargs={"k": 4})
+            return store.as_retriever(search_kwargs={"k": recall_k, "filter": {"agent_id": agent_id}})
+        return store.as_retriever(search_kwargs={"k": recall_k})
 
     def format_docs(self, docs: list[Document]) -> str:
         snippets = []

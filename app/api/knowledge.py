@@ -29,6 +29,7 @@ async def upload_knowledge(
             "doc_id": result.doc_id,
             "version": result.version,
             "chunk_count": result.chunk_count,
-            "status": "indexed" if result.chunk_count > 0 else "empty",
+            "ingest_status": result.ingest_status,
+            "status": result.ingest_status,
         }
     )
