@@ -2,8 +2,6 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { Message, Modal } from '@arco-design/web-vue'
 import {
-  SkillItem,
-  SkillSourceType,
   disableSkill,
   enableSkill,
   deleteSkill,
@@ -12,6 +10,9 @@ import {
   loadSkill,
   uploadLocalSkill,
 } from '../api/skills'
+import type { SkillItem, SkillSourceType } from '../api/skills'
+import { buildPageParams, extractPagedList } from '../utils/pagination'
+import { getApiErrorMessage } from '../utils/request'
 
 const loading = ref(false)
 const skills = ref<SkillItem[]>([])
@@ -82,29 +83,24 @@ const stopTaskPolling = () => {
 
 const resetTaskPolling = () => {
   stopTaskPolling()
-  taskPolling.taskId = ''
-  taskPolling.status = ''
-  taskPolling.skillId = ''
-  taskPolling.error = ''
-  taskPolling.startedAt = 0
+  Object.assign(taskPolling, {
+    taskId: '',
+    status: '',
+    skillId: '',
+    error: '',
+    startedAt: 0,
+  })
 }
 
 const fetchSkills = async () => {
   loading.value = true
   try {
-    const data = await getSkills({
-      page: pagination.page,
-      page_size: pagination.pageSize,
-    })
-    const list = Array.isArray(data?.list)
-      ? data.list
-      : Array.isArray(data?.data?.list)
-        ? data.data.list
-        : []
-    skills.value = list as SkillItem[]
-    pagination.total = data?.total ?? data?.data?.total ?? 0
-  } catch (error: any) {
-    Message.error(error?.message || '获取技能列表失败')
+    const data = await getSkills(buildPageParams(pagination))
+    const { list, total } = extractPagedList<SkillItem>(data)
+    skills.value = list
+    pagination.total = total
+  } catch (error: unknown) {
+    Message.error(getApiErrorMessage(error, '获取技能列表失败'))
   } finally {
     loading.value = false
   }
@@ -115,52 +111,67 @@ const onPageChange = (page: number) => {
   fetchSkills()
 }
 
-const onDisableSkill = (row: SkillItem) => {
+const runSkillMutation = async (
+  action: () => Promise<unknown>,
+  successMessage: string,
+  fallbackErrorMessage: string,
+) => {
+  try {
+    await action()
+    Message.success(successMessage)
+    await fetchSkills()
+  } catch (error: unknown) {
+    Message.error(getApiErrorMessage(error, fallbackErrorMessage))
+  }
+}
+
+const confirmSkillAction = (
+  row: SkillItem,
+  options: {
+    title: string
+    contentPrefix: string
+    successMessage: string
+    fallbackErrorMessage: string
+    action: () => Promise<unknown>
+    okButtonProps?: { status: 'danger' }
+  },
+) => {
   Modal.confirm({
+    title: options.title,
+    content: `${options.contentPrefix}：${row.name}（${row.skill_id}）`,
+    okButtonProps: options.okButtonProps,
+    onOk: () => runSkillMutation(options.action, options.successMessage, options.fallbackErrorMessage),
+  })
+}
+
+const onDisableSkill = (row: SkillItem) => {
+  confirmSkillAction(row, {
     title: '确认禁用该技能？',
-    content: `禁用后技能将不可用：${row.name}（${row.skill_id}）`,
-    onOk: async () => {
-      try {
-        await disableSkill(row.id, { reason: '手动禁用' })
-        Message.success('技能已禁用')
-        fetchSkills()
-      } catch (error: any) {
-        Message.error(getErrorDetail(error, '禁用失败'))
-      }
-    },
+    contentPrefix: '禁用后技能将不可用',
+    successMessage: '技能已禁用',
+    fallbackErrorMessage: '禁用失败',
+    action: () => disableSkill(row.id, { reason: '手动禁用' }),
   })
 }
 
 const onEnableSkill = (row: SkillItem) => {
-  Modal.confirm({
+  confirmSkillAction(row, {
     title: '确认启用该技能？',
-    content: `启用后技能可被调用：${row.name}（${row.skill_id}）`,
-    onOk: async () => {
-      try {
-        await enableSkill(row.id)
-        Message.success('技能已启用')
-        fetchSkills()
-      } catch (error: any) {
-        Message.error(getErrorDetail(error, '启用失败'))
-      }
-    },
+    contentPrefix: '启用后技能可被调用',
+    successMessage: '技能已启用',
+    fallbackErrorMessage: '启用失败',
+    action: () => enableSkill(row.id),
   })
 }
 
 const onDeleteSkill = (row: SkillItem) => {
-  Modal.confirm({
+  confirmSkillAction(row, {
     title: '确认删除该技能？',
-    content: `删除后不可恢复：${row.name}（${row.skill_id}）`,
+    contentPrefix: '删除后不可恢复',
+    successMessage: '技能已删除',
+    fallbackErrorMessage: '删除失败',
+    action: () => deleteSkill(row.id),
     okButtonProps: { status: 'danger' },
-    onOk: async () => {
-      try {
-        await deleteSkill(row.id)
-        Message.success('技能已删除')
-        fetchSkills()
-      } catch (error: any) {
-        Message.error(getErrorDetail(error, '删除失败'))
-      }
-    },
   })
 }
 
@@ -193,9 +204,9 @@ const pollTaskStatusOnce = async () => {
       fetchSkills()
       return
     }
-  } catch (error: any) {
+  } catch (error: unknown) {
     stopTaskPolling()
-    taskPolling.error = error?.message || '任务状态查询失败'
+    taskPolling.error = getApiErrorMessage(error, '任务状态查询失败')
     Message.error(taskPolling.error)
   }
 }
@@ -230,13 +241,6 @@ const resetLoadForm = () => {
   loadForm.uploadFile = null
 }
 
-const getErrorDetail = (error: any, fallback: string) => {
-  const data = error?.response?.data
-  if (typeof data?.detail === 'string' && data.detail) return data.detail
-  if (typeof data?.detail?.reason === 'string' && data.detail.reason) return data.detail.reason
-  if (typeof data?.message === 'string' && data.message) return data.message
-  return error?.message || fallback
-}
 
 const onSubmitLoad = async () => {
   if (!loadForm.source_type) {
@@ -278,8 +282,8 @@ const onSubmitLoad = async () => {
     resetLoadForm()
     fetchSkills()
     startTaskPolling()
-  } catch (error: any) {
-    Message.error(getErrorDetail(error, '加载失败'))
+  } catch (error: unknown) {
+    Message.error(getApiErrorMessage(error, '加载失败'))
   }
 }
 
@@ -294,7 +298,7 @@ onUnmounted(() => {
 
 <template>
   <div class="admin-page">
-    <div class="page-header">
+    <section class="hero glass-panel">
       <div>
         <div class="title">技能管理</div>
         <div class="subtitle">查看技能状态并上传 .skill/.zip 技能归档包</div>
@@ -302,7 +306,7 @@ onUnmounted(() => {
       <div class="actions">
         <a-button type="primary" @click="drawerVisible = true">加载外部技能</a-button>
       </div>
-    </div>
+    </section>
 
     <a-alert v-if="taskPolling.taskId" type="info" class="task-alert" :show-icon="true">
       <template #title>异步加载任务执行中</template>
@@ -418,22 +422,35 @@ onUnmounted(() => {
   gap: 16px;
 }
 
-.page-header {
+.glass-panel {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-md);
+  border-radius: var(--radius-xl);
+}
+
+.hero {
+  padding: 18px 20px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+  background-image: linear-gradient(135deg, rgba(109, 94, 248, 0.22), rgba(39, 211, 195, 0.1));
 }
 
 .title {
-  font-size: 18px;
-  font-weight: 600;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-1);
 }
 
 .subtitle {
-  color: #6b7280;
-  font-size: 12px;
+  color: var(--text-2);
+  font-size: 13px;
+  margin-top: 4px;
 }
 
 .actions {
@@ -454,14 +471,6 @@ onUnmounted(() => {
   flex-wrap: wrap;
 }
 
-.table :deep(.arco-table-header) {
-  background: #f8fafc;
-}
-
-.table :deep(.arco-table-td) {
-  color: #111827;
-}
-
 .pagination {
   display: flex;
   justify-content: flex-end;
@@ -469,19 +478,36 @@ onUnmounted(() => {
 }
 
 .muted {
-  color: #9ca3af;
+  color: var(--text-3);
   font-size: 12px;
 }
 
 .form-tip {
   margin-top: 8px;
-  color: #ef4444;
+  color: #ff8f9f;
   font-size: 12px;
 }
 
 .form-tip-muted {
   margin-top: 8px;
-  color: #6b7280;
+  color: var(--text-3);
   font-size: 12px;
+}
+
+/* 指定区域：状态标签与按钮文字改黑色 */
+:deep(.arco-table .arco-tag),
+:deep(.arco-table .arco-btn),
+:deep(.arco-table .arco-btn .arco-btn-content),
+:deep(.pagination .arco-pagination-item),
+:deep(.pagination .arco-pagination-item-link) {
+  color: #111827 !important;
+}
+
+:deep(.arco-table .arco-tag),
+:deep(.arco-table .arco-btn),
+:deep(.pagination .arco-pagination-item),
+:deep(.pagination .arco-pagination-item-link) {
+  background: rgba(255, 255, 255, 0.92) !important;
+  border-color: rgba(0, 0, 0, 0.28) !important;
 }
 </style>

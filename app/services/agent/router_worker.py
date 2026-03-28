@@ -51,10 +51,10 @@ def _extract_text_content(content: Any) -> str:
 
 def _load_llm(*, streaming: bool = True) -> ChatOpenAI:
     return ChatOpenAI(
-        base_url=settings.llm_gateway_url,
-        api_key=settings.llm_api_key,
-        model=settings.llm_model,
-        timeout=settings.llm_timeout_seconds,
+        base_url=(settings.router_worker_base_url or settings.llm_gateway_url),
+        api_key=(settings.router_worker_api_key or settings.llm_api_key),
+        model=(settings.router_worker_model or settings.llm_model),
+        timeout=float(getattr(settings, "router_worker_timeout_seconds", settings.llm_timeout_seconds)),
         streaming=streaming,
     )
 
@@ -72,11 +72,11 @@ def _route_workers_by_rules(user_query: str) -> list[str]:
         "reference",
         "manual",
         "spec",
+        "根据文档",
+        "基于文档",
     }
-    if any(marker in text for marker in rag_markers):
-        workers.append("knowledge")
-
-    if len(text) > 180 and "knowledge" not in workers:
+    explicit_knowledge = any(marker in text for marker in rag_markers)
+    if explicit_knowledge:
         workers.append("knowledge")
 
     return workers
@@ -139,17 +139,52 @@ def _memory_worker(context_bundle: dict[str, Any]) -> str:
     return "\n".join(lines) if lines else "(无长期记忆命中)"
 
 
-def _knowledge_worker(agent_id: str | None, user_query: str) -> str:
+def _knowledge_worker(agent_id: str | None, user_query: str) -> tuple[str, list[dict[str, Any]]]:
     rag_service = get_rag_service()
     retriever = rag_service.as_retriever(agent_id=agent_id)
     docs = retriever.invoke(user_query)
     if not docs:
-        return "(知识库未命中)"
-    return rag_service.format_docs(docs)
+        return "(知识库未命中)", []
+
+    sources: list[dict[str, Any]] = []
+    for doc in docs[:8]:
+        metadata = getattr(doc, "metadata", {}) or {}
+        sources.append(
+            {
+                "doc_id": metadata.get("doc_id"),
+                "source": metadata.get("source"),
+                "version": metadata.get("version"),
+                "chunk_index": metadata.get("chunk_index"),
+            }
+        )
+    return rag_service.format_docs(docs), sources
 
 
-def _run_workers(*, worker_names: list[str], agent_id: str | None, user_query: str, context_bundle: dict[str, Any]) -> dict[str, str]:
+def _normalize_sources(raw_sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    dedup: dict[str, dict[str, Any]] = {}
+    for item in raw_sources:
+        if not isinstance(item, dict):
+            continue
+        normalized = {
+            "doc_id": item.get("doc_id"),
+            "source": item.get("source"),
+            "version": item.get("version"),
+            "chunk_index": item.get("chunk_index"),
+        }
+        key = json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
+        dedup[key] = normalized
+    return list(dedup.values())
+
+
+def _run_workers(
+    *,
+    worker_names: list[str],
+    agent_id: str | None,
+    user_query: str,
+    context_bundle: dict[str, Any],
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
     outputs: dict[str, str] = {}
+    sources: list[dict[str, Any]] = []
 
     with ThreadPoolExecutor(max_workers=max(1, len(worker_names))) as executor:
         futures: dict[Any, tuple[str, float]] = {}
@@ -164,18 +199,37 @@ def _run_workers(*, worker_names: list[str], agent_id: str | None, user_query: s
             worker_name, started_at = futures[future]
             latency_ms = int((time.perf_counter() - started_at) * 1000)
             try:
-                value = str(future.result() or "")
-                outputs[worker_name] = value
-                _log_worker_event(
-                    event_type="router_worker_trace",
-                    metadata={
-                        "worker_name": worker_name,
-                        "worker_latency_ms": latency_ms,
-                        "worker_success": True,
-                        "error_type": None,
-                        "fallback_reason": "knowledge_miss" if worker_name == "knowledge" and "未命中" in value else None,
-                    },
-                )
+                if worker_name == "knowledge":
+                    worker_output, worker_sources = future.result()
+                    value = str(worker_output or "")
+                    outputs[worker_name] = value
+                    sources.extend(worker_sources or [])
+                    normalized_sources = _normalize_sources(worker_sources or [])
+                    _log_worker_event(
+                        event_type="router_worker_trace",
+                        metadata={
+                            "worker_name": worker_name,
+                            "worker_latency_ms": latency_ms,
+                            "worker_success": True,
+                            "error_type": None,
+                            "fallback_reason": "knowledge_miss" if "未命中" in value else None,
+                            "source_count": len(normalized_sources),
+                            "sources": normalized_sources,
+                        },
+                    )
+                else:
+                    value = str(future.result() or "")
+                    outputs[worker_name] = value
+                    _log_worker_event(
+                        event_type="router_worker_trace",
+                        metadata={
+                            "worker_name": worker_name,
+                            "worker_latency_ms": latency_ms,
+                            "worker_success": True,
+                            "error_type": None,
+                            "fallback_reason": None,
+                        },
+                    )
             except Exception as exc:
                 outputs[worker_name] = f"(worker_error:{type(exc).__name__})"
                 _log_worker_event(
@@ -189,7 +243,7 @@ def _run_workers(*, worker_names: list[str], agent_id: str | None, user_query: s
                     },
                 )
 
-    return outputs
+    return outputs, sources
 
 
 def _build_router_context(*, worker_names: list[str], worker_outputs: dict[str, str], context_bundle: dict[str, Any]) -> SystemMessage:
@@ -217,12 +271,14 @@ def invoke_router_worker(
 ) -> dict[str, Any]:
     total_start = time.perf_counter()
     worker_names = _route_workers(user_query)
-    worker_outputs = _run_workers(
+    worker_outputs, sources = _run_workers(
         worker_names=worker_names,
         agent_id=agent_id,
         user_query=user_query,
         context_bundle=context_bundle,
     )
+
+    sources = _normalize_sources(sources)
 
     llm = _load_llm(streaming=False)
     router_context = _build_router_context(
@@ -242,15 +298,19 @@ def invoke_router_worker(
             "latency_retrieve_ms": int((time.perf_counter() - total_start) * 1000),
             "fallback_reason": None if content else "empty_router_output",
             "workers": worker_names,
+            "source_count": len(sources),
+            "sources": sources,
         },
     )
     final_ai = AIMessage(content=content or "")
     return {
         "messages": [*messages, final_ai],
+        "sources": sources,
         "retrieval_metrics": {
             "retrieval_latency_ms": int((time.perf_counter() - total_start) * 1000),
             "path": "router_worker",
             "fallback_reason": None if content else "empty_router_output",
+            "sources": sources,
         },
     }
 
@@ -264,12 +324,14 @@ def stream_router_worker(
 ) -> Iterator[tuple[str, str, list[AnyMessage] | None]]:
     total_start = time.perf_counter()
     worker_names = _route_workers(user_query)
-    worker_outputs = _run_workers(
+    worker_outputs, sources = _run_workers(
         worker_names=worker_names,
         agent_id=agent_id,
         user_query=user_query,
         context_bundle=context_bundle,
     )
+
+    sources = _normalize_sources(sources)
 
     llm = _load_llm()
     router_context = _build_router_context(
@@ -300,11 +362,13 @@ def stream_router_worker(
             "latency_retrieve_ms": int((time.perf_counter() - total_start) * 1000),
             "fallback_reason": None if assembled.strip() else "empty_router_output",
             "workers": worker_names,
+            "source_count": len(sources),
+            "sources": sources,
         },
     )
 
     if assembled.strip():
         final_state: list[AnyMessage] = [*messages, AIMessage(content=assembled)]
-        yield ("final", assembled, {"messages": final_state, "stream_metrics": metrics})
+        yield ("final", assembled, {"messages": final_state, "stream_metrics": metrics, "sources": sources})
     else:
-        yield ("final", "", {"messages": None, "stream_metrics": metrics})
+        yield ("final", "", {"messages": None, "stream_metrics": metrics, "sources": sources})

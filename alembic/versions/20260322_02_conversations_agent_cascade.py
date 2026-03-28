@@ -17,8 +17,12 @@ branch_labels = None
 depends_on = None
 
 
+def _drop_fk_if_exists(table_name: str, constraint_name: str) -> None:
+    op.execute(sa.text(f'ALTER TABLE {table_name} DROP CONSTRAINT IF EXISTS {constraint_name}'))
+
+
 def upgrade() -> None:
-    op.drop_constraint("conversations_agent_id_fkey", "conversations", type_="foreignkey")
+    _drop_fk_if_exists("conversations", "conversations_agent_id_fkey")
     op.create_foreign_key(
         "conversations_agent_id_fkey",
         "conversations",
@@ -30,7 +34,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_constraint("conversations_agent_id_fkey", "conversations", type_="foreignkey")
+    _drop_fk_if_exists("conversations", "conversations_agent_id_fkey")
     op.create_foreign_key(
         "conversations_agent_id_fkey",
         "conversations",

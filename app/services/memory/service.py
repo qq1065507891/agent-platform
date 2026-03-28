@@ -6,20 +6,23 @@ import hashlib
 import json
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from threading import Lock
 
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
 from langchain_openai import ChatOpenAI
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, desc, or_, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import SessionLocal
+from app.models.memory_embedding import MemoryEmbedding
 from app.models.memory_event import MemoryEvent
 from app.models.memory_item import MemoryItemModel
 from app.models.memory_outbox import MemoryOutbox
+from app.models.memory_record import MemoryRecord
 from app.observability.context import get_trace_id
 from app.services.embeddings import get_embeddings
 from app.services.memory.prompts import MEMORY_EXTRACTION_SYSTEM_PROMPT
@@ -78,6 +81,43 @@ class MemoryService:
     @staticmethod
     def _content_hash(content: str) -> str:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _canonicalize_content(content: str) -> str:
+        text = (content or "").strip().lower()
+        text = " ".join(text.split())
+        replacements = {
+            "，": ",",
+            "。": ".",
+            "：": ":",
+            "；": ";",
+            "（": "(",
+            "）": ")",
+        }
+        for src, dst in replacements.items():
+            text = text.replace(src, dst)
+        return text
+
+    def build_idempotency_key(
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None,
+        conversation_id: str | None,
+        source_message_id: str | None,
+        memory_type: str,
+        content: str,
+    ) -> str:
+        canonical_content = self._canonicalize_content(content)
+        parts = [
+            user_id or "",
+            agent_id or "",
+            conversation_id or "",
+            source_message_id or "",
+            memory_type or "",
+            canonical_content,
+        ]
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
     def _prefetch_cache_key(self, user_id: str, agent_id: str | None, query: str) -> tuple[str, str | None, str]:
         return (user_id, agent_id, self._normalize_query(query))
@@ -151,7 +191,13 @@ class MemoryService:
         where = self._build_where_filter(user_id=user_id, agent_id=agent_id)
 
         vector_start = time.perf_counter()
-        vector_hits = self._vector_recall(query=query, top_k=top_k, where=where, user_id=user_id, agent_id=agent_id)
+        vector_hits = self._vector_recall_with_timeout(
+            query=query,
+            top_k=top_k,
+            where=where,
+            user_id=user_id,
+            agent_id=agent_id,
+        )
         vector_latency_ms = int((time.perf_counter() - vector_start) * 1000)
 
         keyword_start = time.perf_counter()
@@ -172,6 +218,18 @@ class MemoryService:
             query=query,
             hit_count=len(merged),
             latency_ms=total_latency_ms,
+        )
+        self._record_memory_retrieval_breakdown_event(
+            user_id=user_id,
+            agent_id=agent_id,
+            query=query,
+            top_k=top_k,
+            vector_hits=len(vector_hits),
+            lexical_hits=len(keyword_hits),
+            merged_hits=len(merged),
+            vector_latency_ms=vector_latency_ms,
+            lexical_latency_ms=keyword_latency_ms,
+            total_latency_ms=total_latency_ms,
         )
 
         if use_prefetch_cache:
@@ -199,6 +257,15 @@ class MemoryService:
         user_id: str,
         agent_id: str | None,
     ) -> list[MemoryItem]:
+        backend = str(getattr(settings, "memory_backend", "pgvector") or "pgvector").lower()
+        if backend == "pgvector":
+            return self._vector_recall_pgvector(
+                query=query,
+                top_k=top_k,
+                user_id=user_id,
+                agent_id=agent_id,
+            )
+
         store = self._vector_store()
         results = store.similarity_search_with_relevance_scores(query, k=top_k, filter=where)
         memories: list[MemoryItem] = []
@@ -216,10 +283,59 @@ class MemoryService:
             )
         return memories
 
+    def _vector_recall_with_timeout(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        where: dict[str, Any],
+        user_id: str,
+        agent_id: str | None,
+    ) -> list[MemoryItem]:
+        if not bool(getattr(settings, "memory_vector_recall_enabled", True)):
+            return []
+
+        timeout_s = float(getattr(settings, "memory_vector_recall_timeout_seconds", 1.2))
+        if timeout_s <= 0:
+            return []
+
+        try:
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="memory-vector-recall") as executor:
+                future = executor.submit(
+                    self._vector_recall,
+                    query=query,
+                    top_k=top_k,
+                    where=where,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                )
+                return future.result(timeout=timeout_s)
+        except TimeoutError:
+            logger.warning(
+                "[memory-recall] vector timeout user_id=%s agent_id=%s timeout_s=%s query_len=%s",
+                user_id,
+                agent_id,
+                timeout_s,
+                len(query or ""),
+            )
+            return []
+        except Exception as exc:
+            logger.warning("[memory-recall] vector failed user_id=%s agent_id=%s err=%s", user_id, agent_id, exc)
+            return []
+
     def _keyword_recall(self, *, user_id: str, agent_id: str | None, query: str, top_k: int) -> list[MemoryItem]:
         normalized = self._normalize_content(query)
         if not normalized:
             return []
+
+        backend = str(getattr(settings, "memory_backend", "pgvector") or "pgvector").lower()
+        if backend == "pgvector":
+            return self._keyword_recall_pgvector(
+                user_id=user_id,
+                agent_id=agent_id,
+                query=normalized,
+                top_k=top_k,
+            )
 
         with SessionLocal() as db:
             q = db.query(MemoryItemModel).filter(MemoryItemModel.user_id == user_id, MemoryItemModel.state == "active")
@@ -244,6 +360,94 @@ class MemoryService:
                 for row in rows
             ]
 
+    def _vector_recall_pgvector(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        user_id: str,
+        agent_id: str | None,
+    ) -> list[MemoryItem]:
+        query_vec = self._embed_text(query)
+
+        with SessionLocal() as db:
+            stmt = (
+                select(
+                    MemoryRecord.id,
+                    MemoryRecord.memory_type,
+                    MemoryRecord.content,
+                    MemoryRecord.user_id,
+                    MemoryRecord.agent_id,
+                    (1 - MemoryEmbedding.embedding.cosine_distance(query_vec)).label("score"),
+                )
+                .join(MemoryEmbedding, MemoryEmbedding.memory_id == MemoryRecord.id)
+                .where(MemoryRecord.user_id == user_id)
+                .where(MemoryRecord.status == "active")
+            )
+            if agent_id:
+                stmt = stmt.where(or_(MemoryRecord.agent_id == agent_id, MemoryRecord.agent_id.is_(None)))
+            stmt = stmt.order_by(desc("score")).limit(top_k)
+
+            rows = db.execute(stmt).all()
+            return [
+                {
+                    "memory_id": row.id,
+                    "memory_type": row.memory_type,
+                    "content": row.content,
+                    "score": float(row.score or 0.0),
+                    "source": "memory_record",
+                    "user_id": row.user_id,
+                    "agent_id": row.agent_id,
+                }
+                for row in rows
+            ]
+
+    def _keyword_recall_pgvector(
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None,
+        query: str,
+        top_k: int,
+    ) -> list[MemoryItem]:
+        tokens = [token for token in query.split(" ") if token]
+        if not tokens:
+            return []
+
+        with SessionLocal() as db:
+            stmt = (
+                select(
+                    MemoryRecord.id,
+                    MemoryRecord.memory_type,
+                    MemoryRecord.content,
+                    MemoryRecord.user_id,
+                    MemoryRecord.agent_id,
+                    MemoryRecord.updated_at,
+                )
+                .where(MemoryRecord.user_id == user_id)
+                .where(MemoryRecord.status == "active")
+            )
+            if agent_id:
+                stmt = stmt.where(or_(MemoryRecord.agent_id == agent_id, MemoryRecord.agent_id.is_(None)))
+
+            for token in tokens:
+                stmt = stmt.where(MemoryRecord.content_norm.contains(token))
+
+            stmt = stmt.order_by(desc(MemoryRecord.updated_at)).limit(top_k)
+            rows = db.execute(stmt).all()
+            return [
+                {
+                    "memory_id": row.id,
+                    "memory_type": row.memory_type,
+                    "content": row.content,
+                    "score": 0.75,
+                    "source": "memory_record_lexical",
+                    "user_id": row.user_id,
+                    "agent_id": row.agent_id,
+                }
+                for row in rows
+            ]
+
     def _merge_and_rerank(
         self,
         *,
@@ -255,7 +459,8 @@ class MemoryService:
         _ = query
         merged: dict[str, MemoryItem] = {}
         for hit in [*vector_hits, *keyword_hits]:
-            key = self._normalize_content(str(hit.get("content") or ""))
+            memory_id = str(hit.get("memory_id") or "").strip()
+            key = memory_id or self._normalize_content(str(hit.get("content") or ""))
             if not key:
                 continue
             current = merged.get(key)
@@ -299,9 +504,11 @@ class MemoryService:
             return []
 
         model_name = settings.memory_extraction_model or settings.llm_model
+        base_url = settings.memory_extraction_base_url or settings.llm_gateway_url
+        api_key = settings.memory_extraction_api_key or settings.llm_api_key
         llm = ChatOpenAI(
-            base_url=settings.llm_gateway_url,
-            api_key=settings.llm_api_key,
+            base_url=base_url,
+            api_key=api_key,
             model=model_name,
             timeout=float(getattr(settings, "memory_extraction_timeout_seconds", 15.0)),
             streaming=False,
@@ -449,12 +656,28 @@ class MemoryService:
         candidates: list[MemoryWriteCandidate],
         conversation_id: str | None = None,
         trace_id: str | None = None,
+        source_message_id: str | None = None,
+        db: Session | None = None,
     ) -> list[MemoryWriteCandidate]:
         if not candidates:
             return []
 
         if not getattr(settings, "memory_writeback_enabled", True):
             return []
+
+        backend = str(getattr(settings, "memory_backend", "pgvector") or "pgvector").lower()
+        transactional_enabled = bool(getattr(settings, "memory_transactional_write_enabled", True))
+
+        if backend == "pgvector" and transactional_enabled:
+            return self._write_long_term_memories_pgvector(
+                user_id=user_id,
+                agent_id=agent_id,
+                candidates=candidates,
+                conversation_id=conversation_id,
+                trace_id=trace_id,
+                source_message_id=source_message_id,
+                db=db,
+            )
 
         accepted: list[MemoryWriteCandidate] = []
         persisted: list[MemoryWriteCandidate] = []
@@ -484,6 +707,144 @@ class MemoryService:
             self._index_candidates_to_vector_store(user_id=user_id, agent_id=agent_id, candidates=persisted)
 
         return accepted
+
+    def _embed_text(self, content: str, expected_dim: int | None = None) -> list[float]:
+        vectors = get_embeddings().embed_documents([content])
+        if not vectors:
+            raise ValueError("embedding is empty")
+        vector = [float(v) for v in vectors[0]]
+        if expected_dim is not None and len(vector) != expected_dim:
+            raise ValueError(
+                f"embedding dimension mismatch: expected={expected_dim}, actual={len(vector)}, "
+                f"model={settings.llm_embedding or settings.llm_embedding_model}"
+            )
+        return vector
+
+    def _write_long_term_memories_pgvector(
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None,
+        candidates: list[MemoryWriteCandidate],
+        conversation_id: str | None,
+        trace_id: str | None,
+        source_message_id: str | None,
+        db: Session | None,
+    ) -> list[MemoryWriteCandidate]:
+        accepted: list[MemoryWriteCandidate] = []
+        owns_session = db is None
+        session = db or SessionLocal()
+        now = datetime.now(timezone.utc)
+        idempotent_hits = 0
+        write_start = time.perf_counter()
+        write_status = "success"
+        write_error: str | None = None
+
+        try:
+            for candidate in candidates:
+                content = str(candidate.get("content") or "").strip()
+                if not content:
+                    continue
+
+                memory_type = str(candidate.get("memory_type") or "fact").strip().lower()
+                confidence = float(candidate.get("confidence") or 0.0)
+                min_confidence = float(getattr(settings, "memory_writeback_min_confidence", 0.7))
+                if confidence < min_confidence:
+                    continue
+
+                canonical = self._canonicalize_content(content)
+                idempotency_key = self.build_idempotency_key(
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    source_message_id=source_message_id,
+                    memory_type=memory_type,
+                    content=content,
+                )
+
+                record_insert = insert(MemoryRecord).values(
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    source_message_id=source_message_id,
+                    memory_type=memory_type,
+                    content=content,
+                    content_norm=canonical,
+                    idempotency_key=idempotency_key,
+                    confidence=confidence,
+                    consistency_level=str(candidate.get("consistency_level") or "strong"),
+                    status="active",
+                    revision=1,
+                    created_at=now,
+                    updated_at=now,
+                )
+                record_upsert = record_insert.on_conflict_do_update(
+                    index_elements=[MemoryRecord.idempotency_key],
+                    set_={
+                        "content": content,
+                        "content_norm": canonical,
+                        "confidence": confidence,
+                        "updated_at": now,
+                    },
+                ).returning(MemoryRecord.id)
+                existing = session.execute(
+                    select(MemoryRecord.id).where(MemoryRecord.idempotency_key == idempotency_key)
+                ).scalar_one_or_none()
+                if existing is not None:
+                    idempotent_hits += 1
+
+                memory_id = str(session.execute(record_upsert).scalar_one())
+
+                target_dim = int(getattr(settings, "llm_embedding_dimensions", 1024))
+                vector = self._embed_text(content, expected_dim=target_dim)
+                embedding_insert = insert(MemoryEmbedding).values(
+                    memory_id=memory_id,
+                    embedding=vector,
+                    model=(settings.llm_embedding or settings.llm_embedding_model),
+                    dim=target_dim,
+                    created_at=now,
+                )
+                embedding_upsert = embedding_insert.on_conflict_do_update(
+                    index_elements=[MemoryEmbedding.memory_id],
+                    set_={
+                        "embedding": vector,
+                        "model": (settings.llm_embedding or settings.llm_embedding_model),
+                        "dim": target_dim,
+                        "created_at": now,
+                    },
+                )
+                session.execute(embedding_upsert)
+                accepted.append(candidate)
+
+            if owns_session:
+                session.commit()
+            return accepted
+        except Exception as exc:
+            write_status = "failed"
+            write_error = str(exc)
+            if owns_session:
+                session.rollback()
+            raise
+        finally:
+            latency_ms = int((time.perf_counter() - write_start) * 1000)
+            try:
+                self._record_memory_transaction_event(
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    trace_id=trace_id,
+                    status=write_status,
+                    accepted_count=len(accepted),
+                    candidate_count=len(candidates),
+                    idempotent_hits=idempotent_hits,
+                    latency_ms=latency_ms,
+                    error=write_error,
+                )
+            except Exception as obs_exc:
+                logger.warning("memory transaction event log failed: %s", obs_exc)
+
+            if owns_session:
+                session.close()
 
     def enqueue_memory_event(
         self,
@@ -747,6 +1108,86 @@ class MemoryService:
                     payload={
                         "query": query,
                         "hit_count": hit_count,
+                        "latency_ms": latency_ms,
+                    },
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.commit()
+
+    def _record_memory_retrieval_breakdown_event(
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None,
+        query: str,
+        top_k: int,
+        vector_hits: int,
+        lexical_hits: int,
+        merged_hits: int,
+        vector_latency_ms: int,
+        lexical_latency_ms: int,
+        total_latency_ms: int,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with SessionLocal() as db:
+            db.add(
+                MemoryEvent(
+                    event_type="memory_retrieval_breakdown",
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    trace_id=get_trace_id(),
+                    schema_version=1,
+                    status="succeeded",
+                    retry_count=0,
+                    payload={
+                        "query": query,
+                        "top_k": top_k,
+                        "vector_hits": vector_hits,
+                        "lexical_hits": lexical_hits,
+                        "merged_hits": merged_hits,
+                        "vector_latency_ms": vector_latency_ms,
+                        "lexical_latency_ms": lexical_latency_ms,
+                        "total_latency_ms": total_latency_ms,
+                    },
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.commit()
+
+    def _record_memory_transaction_event(
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None,
+        conversation_id: str | None,
+        trace_id: str | None,
+        status: str,
+        accepted_count: int,
+        candidate_count: int,
+        idempotent_hits: int,
+        latency_ms: int,
+        error: str | None,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with SessionLocal() as db:
+            db.add(
+                MemoryEvent(
+                    event_type="memory_transaction_write",
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    trace_id=trace_id or get_trace_id(),
+                    schema_version=1,
+                    status=status,
+                    retry_count=0,
+                    error_message=error,
+                    payload={
+                        "accepted_count": accepted_count,
+                        "candidate_count": candidate_count,
+                        "idempotent_hits": idempotent_hits,
                         "latency_ms": latency_ms,
                     },
                     created_at=now,

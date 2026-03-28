@@ -1,0 +1,17 @@
+{
+    email {$GATEWAY_TLS_EMAIL}
+}
+
+:80 {
+    @http_to_https not tls
+    redir @http_to_https https://{host}{uri}
+}
+
+https://{$GATEWAY_DOMAIN} {
+    encode zstd gzip
+
+    @api path /api/*
+    reverse_proxy @api backend:8000
+
+    reverse_proxy frontend:8080
+}

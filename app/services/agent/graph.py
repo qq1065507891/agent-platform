@@ -20,12 +20,12 @@ from app.models.agent import Agent
 from app.observability.context import get_agent_id, get_conversation_id, get_trace_id, get_user_id
 from app.observability.service import ObservabilityService
 from app.services.rag_service import get_rag_service
+from app.services.agent.mode_normalizer import normalize_mode_for_telemetry
 from app.services.sandbox import SandboxSecurityError, SandboxTimeoutError, execute_skill_code_safely
 from app.services.skills.builtin import BUILTIN_TOOLS
 from app.services.skills.service import SkillService
 from app.services.streaming import (
     StreamAssembler,
-    extract_text_content,
     iter_public_stream_events,
     iter_unified_events_from_graph_event,
     iter_unified_events_from_llm_stream,
@@ -119,12 +119,19 @@ def _log_react_loop_event(event_type: str, metadata: dict[str, Any]) -> None:
         db.close()
 
 
-def _load_llm(*, streaming: bool = True) -> ChatOpenAI:
+def _load_llm(
+    *,
+    streaming: bool = True,
+    model: str | None = None,
+    timeout_seconds: float | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+) -> ChatOpenAI:
     return ChatOpenAI(
-        base_url=settings.llm_gateway_url,
-        api_key=settings.llm_api_key,
-        model=settings.llm_model,
-        timeout=settings.llm_timeout_seconds,
+        base_url=(base_url or settings.llm_gateway_url),
+        api_key=(api_key or settings.llm_api_key),
+        model=(model or settings.llm_model),
+        timeout=(timeout_seconds if timeout_seconds is not None else settings.llm_timeout_seconds),
         streaming=streaming,
     )
 
@@ -288,32 +295,18 @@ def _extract_text_content(content: Any) -> str:
     return ""
 
 
-def _build_memory_system_message(context_bundle: dict[str, Any] | None) -> SystemMessage | None:
-    if not context_bundle:
-        return None
-
-    short_context = str(context_bundle.get("short_context") or "")
-    summary = str(context_bundle.get("summary") or "")
-    long_memories = context_bundle.get("long_memories") or []
-
-    memory_lines: list[str] = []
-    for item in long_memories:
-        if not isinstance(item, dict):
-            continue
-        content = str(item.get("content") or "").strip()
-        if not content:
-            continue
-        memory_type = str(item.get("memory_type") or "memory")
-        memory_lines.append(f"- [{memory_type}] {content}")
-
-    memory_block = "\n".join(memory_lines) if memory_lines else "- (暂无长期记忆命中)"
-    prompt = (
-        "以下为上下文工程注入内容，请仅在相关时使用，不得编造事实。\n"
-        f"【会话摘要】\n{summary or '(暂无摘要)'}\n\n"
-        f"【短期记忆（最近轮次）】\n{short_context or '(暂无短期记忆)'}\n\n"
-        f"【长期记忆召回】\n{memory_block}"
-    )
-    return SystemMessage(content=prompt)
+def _summarize_retrieved_docs(docs: list[Any], *, max_docs: int = 5, max_chars_per_doc: int = 180) -> str:
+    snippets: list[str] = []
+    for doc in docs[:max_docs]:
+        metadata = getattr(doc, "metadata", {}) or {}
+        text = str(getattr(doc, "page_content", "") or "").strip().replace("\n", " ")
+        if len(text) > max_chars_per_doc:
+            text = text[:max_chars_per_doc] + "..."
+        source = str(metadata.get("source") or "")
+        doc_id = str(metadata.get("doc_id") or "")
+        version = str(metadata.get("version") or "")
+        snippets.append(f"- [{doc_id}][v{version}][{source}] {text}")
+    return "\n".join(snippets)
 
 
 def _get_react_max_steps() -> int:
@@ -367,47 +360,59 @@ def should_continue(state: AgentState) -> str:
     return decision
 
 
-def build_agent_graph(agent_id: str | None = None) -> Any:
+def build_agent_graph(agent_id: str | None = None, *, enable_retriever_tool: bool = True) -> Any:
     rag_service = get_rag_service()
 
-    @tool
-    def retriever_tool(query: str) -> str:
-        """检索内部知识库，返回与问题最相关的片段。"""
-        start = time.perf_counter()
-        recall_k = int(getattr(settings, "rag_recall_k", 24))
-        try:
-            retriever = rag_service.as_retriever(agent_id=agent_id)
-            docs = retriever.invoke(query)
-            _log_react_loop_event(
-                event_type="retrieval_trace",
-                metadata={
-                    "query_len": len(query or ""),
-                    "recall_k": recall_k,
-                    "returned_k": len(docs or []),
-                    "latency_retrieve_ms": int((time.perf_counter() - start) * 1000),
-                    "fallback_reason": None,
-                    "source": "graph_retriever_tool",
-                },
-            )
-            if not docs:
-                return "知识库暂无匹配内容。"
-            return rag_service.format_docs(docs)
-        except Exception as exc:
-            _log_react_loop_event(
-                event_type="retrieval_trace",
-                metadata={
-                    "query_len": len(query or ""),
-                    "recall_k": recall_k,
-                    "returned_k": 0,
-                    "latency_retrieve_ms": int((time.perf_counter() - start) * 1000),
-                    "fallback_reason": f"{type(exc).__name__}",
-                    "source": "graph_retriever_tool",
-                },
-            )
-            return "知识库检索暂时不可用，请稍后重试。"
-
     dynamic_tools = _build_external_skill_tools(agent_id)
-    tools = [*list(BUILTIN_TOOLS.values()), retriever_tool, *dynamic_tools]
+    tools: list[Any] = [*list(BUILTIN_TOOLS.values())]
+
+    if enable_retriever_tool:
+
+        @tool
+        def retriever_tool(query: str) -> str:
+            """检索内部知识库，返回与问题最相关的片段。"""
+            start = time.perf_counter()
+            recall_k = int(getattr(settings, "rag_recall_k", 24))
+            min_score = float(getattr(settings, "rag_similarity_min_score", 0.0))
+            try:
+                docs = rag_service.retrieve(query, agent_id=agent_id)
+                _log_react_loop_event(
+                    event_type="retrieval_trace",
+                    metadata={
+                        "query_len": len(query or ""),
+                        "recall_k": recall_k,
+                        "returned_k": len(docs or []),
+                        "latency_retrieve_ms": int((time.perf_counter() - start) * 1000),
+                        "fallback_reason": None,
+                        "source": "graph_retriever_tool",
+                        "min_score": min_score,
+                    },
+                )
+                if not docs:
+                    return "我未检索到相关资料，先基于已有信息回答你。"
+                summarized = _summarize_retrieved_docs(docs)
+                return (
+                    "以下是检索摘要（禁止逐字复述原文，请基于其进行归纳回答）：\n"
+                    f"{summarized}"
+                )
+            except Exception as exc:
+                _log_react_loop_event(
+                    event_type="retrieval_trace",
+                    metadata={
+                        "query_len": len(query or ""),
+                        "recall_k": recall_k,
+                        "returned_k": 0,
+                        "latency_retrieve_ms": int((time.perf_counter() - start) * 1000),
+                        "fallback_reason": f"{type(exc).__name__}",
+                        "source": "graph_retriever_tool",
+                        "min_score": min_score,
+                    },
+                )
+                return "知识库检索暂时不可用，请稍后重试。"
+
+        tools.append(retriever_tool)
+
+    tools.extend(dynamic_tools)
 
     react_llm = _load_llm().bind_tools(tools)
 
@@ -429,7 +434,8 @@ def build_agent_graph(agent_id: str | None = None) -> Any:
                 "你是 ReAct 单模型代理。请严格遵循："
                 "若无需调用工具，直接输出最终答复；"
                 "仅在确实需要外部信息或动作时发起 tool_calls；"
-                "不要输出空内容。"
+                "不要输出空内容；"
+                "对于检索工具返回内容，只能归纳总结，不得逐字复述原文大段文本。"
             )
         )
         # memory system prompt 已在 ConversationService 统一注入，避免重复注入。
@@ -501,16 +507,17 @@ def build_agent_graph(agent_id: str | None = None) -> Any:
     return graph.compile()
 
 
-def get_or_build_agent_graph(agent_id: str | None = None) -> Any:
+def get_or_build_agent_graph(agent_id: str | None = None, *, enable_retriever_tool: bool = True) -> Any:
     fingerprint = _get_agent_skills_fingerprint(agent_id)
-    cache_key = (agent_id, fingerprint, settings.llm_model)
+    retriever_mode = "with_retriever" if enable_retriever_tool else "no_retriever"
+    cache_key = (agent_id, fingerprint, f"{settings.llm_model}:{retriever_mode}")
     ttl_seconds = int(getattr(settings, "graph_cache_ttl_seconds", 120))
 
     cached = _GRAPH_CACHE.get(cache_key)
     if cached and _is_cache_valid(cached[0], ttl_seconds):
         return cached[1]
 
-    graph = build_agent_graph(agent_id=agent_id)
+    graph = build_agent_graph(agent_id=agent_id, enable_retriever_tool=enable_retriever_tool)
     _GRAPH_CACHE[cache_key] = (time.time(), graph)
     return graph
 
@@ -619,6 +626,8 @@ def extract_assistant_message(messages: list[AnyMessage]) -> str:
 def stream_assistant_message(
     graph: Any,
     input_state: dict[str, Any] | list[AnyMessage],
+    *,
+    timeout_seconds: float | None = None,
 ) -> Iterator[tuple[str, str, list[AnyMessage] | None]]:
     """通过统一协议适配 graph stream 并转发 SSE 事件。"""
     app_env = getattr(settings, "app_env", "development")
@@ -660,7 +669,11 @@ def stream_assistant_message(
 
     # graph 流为空时，按配置决定是否先走 graph.invoke 兜底（可关闭以降低长尾延迟），再退化为纯 LLM 兜底。
     non_stream_text = ""
-    fallback_timeout_seconds = float(getattr(settings, "llm_fallback_timeout_seconds", 20.0))
+    fallback_timeout_seconds = (
+        float(timeout_seconds)
+        if timeout_seconds is not None
+        else float(getattr(settings, "llm_fallback_timeout_seconds", 20.0))
+    )
 
     if bool(getattr(settings, "stream_graph_invoke_fallback_enabled", False)):
         graph_invoke_start = time.perf_counter()
@@ -713,12 +726,19 @@ def stream_assistant_message(
     yield ("final", EMPTY_ASSISTANT_REPLY, final_state_messages)
 
 
-def _invoke_llm_non_stream(messages: list[AnyMessage], *, timeout_seconds: float | None = None) -> str:
+def _invoke_llm_non_stream(
+    messages: list[AnyMessage],
+    *,
+    timeout_seconds: float | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+) -> str:
     """Fallback for providers that stream empty chunks but return content in non-stream mode."""
     llm = ChatOpenAI(
-        base_url=settings.llm_gateway_url,
-        api_key=settings.llm_api_key,
-        model=settings.llm_model,
+        base_url=(base_url or settings.llm_gateway_url),
+        api_key=(api_key or settings.llm_api_key),
+        model=(model or settings.llm_model),
         timeout=(timeout_seconds if timeout_seconds is not None else settings.llm_timeout_seconds),
         streaming=False,
     )
@@ -728,21 +748,23 @@ def _invoke_llm_non_stream(messages: list[AnyMessage], *, timeout_seconds: float
     return _extract_text_content(getattr(response, "content", ""))
 
 
-def _safe_json(value: Any, max_len: int = 1200) -> str:
-    try:
-        text = json.dumps(value, ensure_ascii=False, default=str)
-    except Exception:
-        text = repr(value)
-    if len(text) > max_len:
-        return text[:max_len] + "...<truncated>"
-    return text
-
-
-def stream_assistant_message_direct(messages: list[AnyMessage]) -> Iterator[tuple[str, str, list[AnyMessage] | None]]:
+def stream_assistant_message_direct(
+    messages: list[AnyMessage],
+    *,
+    model: str | None = None,
+    timeout_seconds: float | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+) -> Iterator[tuple[str, str, list[AnyMessage] | None]]:
     app_env = getattr(settings, "app_env", "development")
     debug_stream = str(app_env).lower() != "production"
 
-    llm = _load_llm()
+    llm = _load_llm(
+        model=model,
+        timeout_seconds=timeout_seconds,
+        base_url=base_url,
+        api_key=api_key,
+    )
     assembler = StreamAssembler()
 
     if debug_stream:
@@ -775,7 +797,13 @@ def stream_assistant_message_direct(messages: list[AnyMessage]) -> Iterator[tupl
     fallback_timeout_seconds = float(getattr(settings, "llm_fallback_timeout_seconds", 20.0))
     llm_fallback_start = time.perf_counter()
     try:
-        non_stream_text = _invoke_llm_non_stream(messages, timeout_seconds=fallback_timeout_seconds)
+        non_stream_text = _invoke_llm_non_stream(
+            messages,
+            timeout_seconds=fallback_timeout_seconds,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+        )
     except Exception as exc:
         if debug_stream:
             logger.warning("[stream-debug] non-stream fallback failed: %s", exc)
@@ -797,3 +825,39 @@ def stream_assistant_message_direct(messages: list[AnyMessage]) -> Iterator[tupl
     if debug_stream:
         logger.info("[stream-debug] direct stream produced no usable text; return empty fallback")
     yield ("final", EMPTY_ASSISTANT_REPLY, None)
+
+
+def execute_mode_path(
+    *,
+    mode: str,
+    agent_id: str | None,
+    messages: list[AnyMessage],
+    context_bundle: dict[str, Any],
+    user_query: str,
+    enable_retriever_tool: bool | None = None,
+) -> dict[str, Any]:
+    """Execute one mode path with normalized output payload."""
+    normalized_mode = normalize_mode_for_telemetry(mode)
+    if normalized_mode not in {"fast", "planner", "rag"}:
+        logger.warning(
+            "execute_mode_path received unsupported mode, fallback to fast: raw=%s normalized=%s",
+            mode,
+            normalized_mode,
+        )
+        normalized_mode = "fast"
+
+    retriever_enabled = bool(enable_retriever_tool) if enable_retriever_tool is not None else (normalized_mode == "rag")
+    if normalized_mode == "planner":
+        graph = get_or_build_agent_graph(agent_id=agent_id, enable_retriever_tool=True)
+    elif normalized_mode == "rag":
+        graph = get_or_build_agent_graph(agent_id=agent_id, enable_retriever_tool=True)
+    else:
+        graph = get_or_build_agent_graph(agent_id=agent_id, enable_retriever_tool=retriever_enabled)
+
+    return graph.invoke(
+        {
+            "messages": messages,
+            "context_bundle": context_bundle,
+            "user_query": user_query,
+        }
+    )

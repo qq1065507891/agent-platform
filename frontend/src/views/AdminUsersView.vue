@@ -3,6 +3,8 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { Message } from '@arco-design/web-vue'
 import { createUser, getUsers, importUsers, updateUser } from '../api/users'
 import { getRoles } from '../api/roles'
+import { getApiErrorMessage } from '../utils/request'
+import { buildPageParams, extractPagedList } from '../utils/pagination'
 
 interface UserRow {
   id?: string
@@ -13,8 +15,6 @@ interface UserRow {
   status: 'active' | 'disabled'
   created_at?: string
 }
-
-const buildRowKey = (item: UserRow) => item.id || item._rowKey || `${item.username}-${item.email}`
 
 const normalizeRow = (item: UserRow): UserRow => ({
   ...item,
@@ -68,29 +68,25 @@ const fetchRoles = async () => {
     const data = await getRoles()
     const list = Array.isArray(data) ? data : data?.list
     roles.value = (list || []).map((item: any) => ({ label: item.name, value: item.name }))
-  } catch (error: any) {
-    Message.error(error?.message || '获取角色失败')
+  } catch (error: unknown) {
+    Message.error(getApiErrorMessage(error, '获取角色失败'))
   }
 }
 
 const fetchUsers = async () => {
   loading.value = true
   try {
-    const data = await getUsers({
-      page: pagination.page,
-      page_size: pagination.pageSize,
-      keyword: keyword.value || undefined,
-    })
-    const list = Array.isArray(data?.list)
-      ? data.list
-      : Array.isArray(data?.data?.list)
-        ? data.data.list
-        : []
-    users.value = list.map((item: UserRow) => normalizeRow(item))
+    const data = await getUsers(
+      buildPageParams(pagination, {
+        keyword: keyword.value || undefined,
+      })
+    )
+    const { list, total } = extractPagedList<UserRow>(data)
+    users.value = list.map((item) => normalizeRow(item))
     tableData.value = users.value
-    pagination.total = data?.total ?? data?.data?.total ?? 0
-  } catch (error: any) {
-    Message.error(error?.message || '获取用户失败')
+    pagination.total = total
+  } catch (error: unknown) {
+    Message.error(getApiErrorMessage(error, '获取用户失败'))
   } finally {
     loading.value = false
   }
@@ -106,24 +102,34 @@ const onPageChange = (page: number) => {
   fetchUsers()
 }
 
-const onStatusChange = async (row: UserRow, status: 'active' | 'disabled') => {
+const updateUserField = async (
+  row: UserRow,
+  patch: { status?: 'active' | 'disabled'; role?: string },
+  onSuccess: () => void,
+) => {
+  if (!row.id) {
+    Message.error('用户ID缺失，无法更新')
+    return
+  }
   try {
-    await updateUser(row.id, { status })
-    row.status = status
-    Message.success('状态已更新')
-  } catch (error: any) {
-    Message.error(error?.message || '更新失败')
+    await updateUser(row.id, patch)
+    onSuccess()
+    Message.success('更新成功')
+  } catch (error: unknown) {
+    Message.error(getApiErrorMessage(error, '更新失败'))
   }
 }
 
+const onStatusChange = async (row: UserRow, status: 'active' | 'disabled') => {
+  await updateUserField(row, { status }, () => {
+    row.status = status
+  })
+}
+
 const onRoleChange = async (row: UserRow, role: string) => {
-  try {
-    await updateUser(row.id, { role })
+  await updateUserField(row, { role }, () => {
     row.role = role
-    Message.success('角色已更新')
-  } catch (error: any) {
-    Message.error(error?.message || '更新失败')
-  }
+  })
 }
 
 const onCreateUser = async () => {
@@ -154,8 +160,8 @@ const onCreateUser = async () => {
     keyword.value = ''
     pagination.page = 1
     fetchUsers()
-  } catch (error: any) {
-    Message.error(error?.message || '创建失败')
+  } catch (error: unknown) {
+    Message.error(getApiErrorMessage(error, '创建失败'))
   }
 }
 
@@ -184,8 +190,8 @@ const onImportUsers = async () => {
     importVisible.value = false
     importForm.text = ''
     fetchUsers()
-  } catch (error: any) {
-    Message.error(error?.message || '导入失败')
+  } catch (error: unknown) {
+    Message.error(getApiErrorMessage(error, '导入失败'))
   }
 }
 
@@ -197,21 +203,24 @@ onMounted(() => {
 
 <template>
   <div class="admin-page">
-    <div class="page-header">
+    <section class="hero glass-panel">
       <div>
         <div class="title">用户管理</div>
         <div class="subtitle">管理用户角色与状态</div>
       </div>
-      <div class="actions">
-        <a-input-search
-          v-model="keyword"
-          placeholder="搜索用户名/邮箱"
-          allow-clear
-          @search="onSearch"
-        />
+      <div class="hero-actions">
         <a-button type="primary" @click="createVisible = true">新增用户</a-button>
         <a-button type="outline" @click="importVisible = true">批量导入</a-button>
       </div>
+    </section>
+
+    <div class="toolbar glass-panel">
+      <a-input-search
+        v-model="keyword"
+        placeholder="搜索用户名/邮箱"
+        allow-clear
+        @search="onSearch"
+      />
     </div>
 
     <a-table
@@ -230,7 +239,7 @@ onMounted(() => {
           :model-value="record.role"
           :options="roles"
           size="small"
-          @change="(value) => onRoleChange(record, String(value))"
+          @change="(value: string | number | boolean) => onRoleChange(record, String(value))"
         />
       </template>
       <template #status="{ record }">
@@ -241,7 +250,7 @@ onMounted(() => {
             { label: '启用', value: 'active' },
             { label: '禁用', value: 'disabled' },
           ]"
-          @change="(value) => onStatusChange(record, value as 'active' | 'disabled')"
+          @change="(value: string | number | boolean) => onStatusChange(record, String(value) as 'active' | 'disabled')"
         />
       </template>
       <template #created_at="{ record }">
@@ -329,42 +338,50 @@ onMounted(() => {
   gap: 16px;
 }
 
-.page-header {
+.glass-panel {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-md);
+  border-radius: var(--radius-xl);
+}
+
+.hero {
+  padding: 18px 20px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+  background-image: linear-gradient(135deg, rgba(109, 94, 248, 0.22), rgba(39, 211, 195, 0.1));
 }
 
 .title {
-  font-size: 18px;
-  font-weight: 600;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-1);
 }
 
 .subtitle {
-  color: #6b7280;
-  font-size: 12px;
+  color: var(--text-2);
+  font-size: 13px;
+  margin-top: 4px;
 }
 
-.actions {
+.hero-actions {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
 }
 
-.table :deep(.arco-table-header) {
-  background: #f8fafc;
-}
-
-.table :deep(.arco-table-td) {
-  color: #111827;
+.toolbar {
+  padding: 12px;
 }
 
 .table :deep(.arco-select-view) {
   min-width: 120px;
 }
-
 
 .pagination {
   display: flex;
@@ -374,13 +391,13 @@ onMounted(() => {
 
 .import-tip {
   margin-bottom: 10px;
-  color: #4b5563;
+  color: var(--text-2);
   font-size: 13px;
 }
 
 .import-sample {
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 10px;
   padding: 12px;
   margin-bottom: 12px;
@@ -389,7 +406,7 @@ onMounted(() => {
 .import-sample-title {
   font-size: 12px;
   font-weight: 600;
-  color: #334155;
+  color: var(--text-2);
   margin-bottom: 8px;
 }
 
@@ -399,6 +416,6 @@ onMounted(() => {
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
-  color: #0f172a;
+  color: var(--text-1);
 }
 </style>

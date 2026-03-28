@@ -5,9 +5,12 @@ import sys
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
+import pytest
+
 from app.services.rag_service import RAGService
 
 
+@pytest.mark.rag_light
 def test_build_documents_contains_expected_metadata_fields():
     service = RAGService()
     chunks = ["alpha content", "beta content"]

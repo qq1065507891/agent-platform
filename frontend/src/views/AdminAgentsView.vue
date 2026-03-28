@@ -2,6 +2,8 @@
 import { onMounted, reactive, ref } from 'vue'
 import { Message, Modal } from '@arco-design/web-vue'
 import { deleteAgent, getAgents } from '../api/agents'
+import { getApiErrorMessage } from '../utils/request'
+import { buildPageParams, extractPagedList } from '../utils/pagination'
 
 interface AgentItem {
   id: string
@@ -45,16 +47,17 @@ const formatOwner = (agent: AgentItem) => {
 const fetchAgents = async () => {
   loading.value = true
   try {
-    const data = await getAgents({
-      page: pagination.page,
-      page_size: pagination.pageSize,
-      keyword: keyword.value || undefined,
-      is_public: onlyPublic.value ? true : undefined,
-    })
-    agents.value = Array.isArray(data?.list) ? data.list : []
-    pagination.total = Number(data?.total || 0)
-  } catch (error: any) {
-    Message.error(error?.message || '获取智能体失败')
+    const response = await getAgents(
+      buildPageParams(pagination, {
+        keyword: keyword.value || undefined,
+        is_public: onlyPublic.value ? true : undefined,
+      })
+    )
+    const { list, total } = extractPagedList<AgentItem>(response)
+    agents.value = list
+    pagination.total = total
+  } catch (error: unknown) {
+    Message.error(getApiErrorMessage(error, '获取智能体失败'))
   } finally {
     loading.value = false
   }
@@ -70,28 +73,46 @@ const onPageChange = (page: number) => {
   fetchAgents()
 }
 
-const onDeleteAgent = (agent: AgentItem) => {
+const runDeleteAgent = async (agent: AgentItem) => {
+  if (deletingAgentId.value) return
+  deletingAgentId.value = agent.id
+  try {
+    await deleteAgent(agent.id)
+    Message.success('智能体已删除')
+    if (agents.value.length === 1 && pagination.page > 1) {
+      pagination.page -= 1
+    }
+    await fetchAgents()
+  } catch (error: unknown) {
+    Message.error(getApiErrorMessage(error, '删除失败'))
+  } finally {
+    deletingAgentId.value = ''
+  }
+}
+
+const confirmAgentAction = (
+  agent: AgentItem,
+  options: {
+    title: string
+    contentPrefix: string
+    okButtonProps?: { status: 'danger' }
+    onOk: () => Promise<void>
+  },
+) => {
   Modal.confirm({
+    title: options.title,
+    content: `${options.contentPrefix}：${agent.name}`,
+    okButtonProps: options.okButtonProps,
+    onOk: options.onOk,
+  })
+}
+
+const onDeleteAgent = (agent: AgentItem) => {
+  confirmAgentAction(agent, {
     title: '确认删除该智能体？',
-    content: `删除后不可恢复：${agent.name}`,
+    contentPrefix: '删除后不可恢复',
     okButtonProps: { status: 'danger' },
-    onOk: async () => {
-      if (deletingAgentId.value) return
-      deletingAgentId.value = agent.id
-      try {
-        await deleteAgent(agent.id)
-        Message.success('智能体已删除')
-        if (agents.value.length === 1 && pagination.page > 1) {
-          pagination.page -= 1
-        }
-        await fetchAgents()
-      } catch (error: any) {
-        const detail = error?.response?.data?.detail
-        Message.error(detail || error?.message || '删除失败')
-      } finally {
-        deletingAgentId.value = ''
-      }
-    },
+    onOk: () => runDeleteAgent(agent),
   })
 }
 
@@ -100,14 +121,14 @@ onMounted(fetchAgents)
 
 <template>
   <div class="admin-page">
-    <div class="page-header">
+    <section class="hero glass-panel">
       <div>
         <div class="title">智能体管理</div>
         <div class="subtitle">管理员可查看并删除全部智能体</div>
       </div>
-    </div>
+    </section>
 
-    <div class="toolbar">
+    <div class="toolbar glass-panel">
       <a-input-search v-model="keyword" placeholder="搜索智能体名称" allow-clear @search="onSearch" />
       <a-checkbox v-model="onlyPublic" @change="onSearch">仅看公开</a-checkbox>
     </div>
@@ -164,21 +185,35 @@ onMounted(fetchAgents)
   gap: 16px;
 }
 
-.page-header {
+.glass-panel {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-md);
+  border-radius: var(--radius-xl);
+}
+
+.hero {
+  padding: 18px 20px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
+  background-image: linear-gradient(135deg, rgba(109, 94, 248, 0.22), rgba(79, 140, 255, 0.12));
 }
 
 .title {
-  font-size: 18px;
-  font-weight: 600;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-1);
 }
 
 .subtitle {
-  color: #6b7280;
-  font-size: 12px;
+  color: var(--text-2);
+  font-size: 13px;
+  margin-top: 4px;
 }
 
 .toolbar {
@@ -186,6 +221,7 @@ onMounted(fetchAgents)
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+  padding: 12px;
 }
 
 .agent-card {
@@ -193,6 +229,9 @@ onMounted(fetchAgents)
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .card-title {
@@ -209,7 +248,7 @@ onMounted(fetchAgents)
 }
 
 .desc {
-  color: #6b7280;
+  color: var(--text-2);
   margin: 8px 0 12px;
 }
 
@@ -218,7 +257,7 @@ onMounted(fetchAgents)
   justify-content: space-between;
   gap: 12px;
   font-size: 12px;
-  color: #4b5563;
+  color: var(--text-3);
 }
 
 .pagination {

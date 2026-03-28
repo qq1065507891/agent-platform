@@ -13,7 +13,8 @@ if str(BASE_DIR) not in sys.path:
     sys.path.append(str(BASE_DIR))
 
 from app.core.database import Base
-from app import models  # noqa: F401
+
+__import__("app.models")
 
 config = context.config
 
@@ -25,7 +26,12 @@ def get_database_url() -> str:
     return os.getenv("DB_URL", config.get_main_option("sqlalchemy.url"))
 
 
-config.set_main_option("sqlalchemy.url", get_database_url())
+def _escape_config_interpolation(value: str) -> str:
+    # Alembic uses ConfigParser interpolation, '%' must be escaped as '%%'.
+    return value.replace("%", "%%")
+
+
+config.set_main_option("sqlalchemy.url", _escape_config_interpolation(get_database_url()))
 
 
 target_metadata = Base.metadata

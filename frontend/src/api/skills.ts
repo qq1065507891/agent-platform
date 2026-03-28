@@ -9,6 +9,7 @@ export type SkillSourceType =
   | 'http'
   | 'local'
   | 'private_registry'
+  | 'mcp'
 
 export interface SkillItem {
   id: string

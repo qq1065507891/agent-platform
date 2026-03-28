@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -12,6 +10,7 @@ from app.api import auth as auth_router
 from app.api import conversations as conversations_router
 from app.api import knowledge as knowledge_router
 from app.api import memory_ops as memory_ops_router
+from app.api import mcp_tools as mcp_tools_router
 from app.api import metrics as metrics_router
 from app.api import permissions as permissions_router
 from app.api import roles as roles_router
@@ -21,13 +20,25 @@ from app.core.logging import get_logger, setup_logging
 from app.observability.context import get_request_id, get_trace_id
 from app.observability.middleware import TraceMiddleware
 from app.schemas.common import ErrorDetail, ErrorResponse
+from app.services.embeddings import get_embeddings
 
 
 setup_logging()
 logger = get_logger("agent-platform")
 
+
 app = FastAPI(title="Agent Platform API", version="v1")
 app.add_middleware(TraceMiddleware)
+
+
+def _attach_trace_headers(response: JSONResponse) -> JSONResponse:
+    trace_id = get_trace_id()
+    request_id = get_request_id()
+    if trace_id:
+        response.headers["X-Trace-Id"] = trace_id
+    if request_id:
+        response.headers["X-Request-Id"] = request_id
+    return response
 
 app.include_router(auth_router.router, prefix="/api/v1")
 app.include_router(users_router.router, prefix="/api/v1")
@@ -36,9 +47,20 @@ app.include_router(permissions_router.router, prefix="/api/v1")
 app.include_router(agents_router.router, prefix="/api/v1")
 app.include_router(conversations_router.router, prefix="/api/v1")
 app.include_router(skills_router.router, prefix="/api/v1")
+app.include_router(mcp_tools_router.router, prefix="/api/v1")
 app.include_router(knowledge_router.router, prefix="/api/v1")
 app.include_router(memory_ops_router.router, prefix="/api/v1")
 app.include_router(metrics_router.router, prefix="/api/v1")
+
+
+@app.on_event("startup")
+async def warmup_embedding_client() -> None:
+    try:
+        embeddings = get_embeddings()
+        embeddings.embed_query("warmup")
+        logger.info("embedding_client_warmup_ok")
+    except Exception as exc:
+        logger.warning("embedding_client_warmup_failed", error=str(exc), error_type=type(exc).__name__)
 
 
 @app.get("/")
@@ -61,7 +83,6 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSONResponse:
     trace_id = get_trace_id()
-    request_id = get_request_id()
     logger.warning(
         "http_exception",
         status_code=exc.status_code,
@@ -73,17 +94,12 @@ async def http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSO
         detail=ErrorDetail(reason=str(exc.detail), trace_id=trace_id),
     )
     response = JSONResponse(status_code=exc.status_code, content=payload.model_dump())
-    if trace_id:
-        response.headers["X-Trace-Id"] = trace_id
-    if request_id:
-        response.headers["X-Request-Id"] = request_id
-    return response
+    return _attach_trace_headers(response)
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(_: Request, exc: Exception) -> JSONResponse:
     trace_id = get_trace_id()
-    request_id = get_request_id()
     logger.exception("unhandled_exception", error_type=type(exc).__name__, error=str(exc), exc_info=exc)
     payload = ErrorResponse(
         code=5000,
@@ -91,8 +107,4 @@ async def global_exception_handler(_: Request, exc: Exception) -> JSONResponse:
         detail=ErrorDetail(reason=str(exc), trace_id=trace_id),
     )
     response = JSONResponse(status_code=500, content=payload.model_dump())
-    if trace_id:
-        response.headers["X-Trace-Id"] = trace_id
-    if request_id:
-        response.headers["X-Request-Id"] = request_id
-    return response
+    return _attach_trace_headers(response)

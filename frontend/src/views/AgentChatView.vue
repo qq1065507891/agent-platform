@@ -2,8 +2,9 @@
 import { computed, onMounted, ref, watch, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { Message } from '@arco-design/web-vue'
-import request from '../utils/request'
 import { getAgentDetail } from '../api/agents'
+import { createConversation, getConversation } from '../api/conversations'
+import { getApiErrorMessage } from '../utils/request'
 
 interface ChatMessage {
   role: 'user' | 'assistant'
@@ -42,7 +43,7 @@ const fetchAgentInfo = async () => {
   try {
     agentInfo.value = await getAgentDetail(agentId.value)
   } catch (error: any) {
-    Message.error(error?.message || '加载智能体失败')
+    Message.error(getApiErrorMessage(error, '加载智能体失败'))
   }
 }
 
@@ -51,10 +52,10 @@ const ensureConversation = async () => {
   if (conversation.value?.id) return
   loading.value = true
   try {
-    const data = await request.post('/conversations', { agent_id: agentId.value })
+    const data = await createConversation({ agent_id: agentId.value })
     conversation.value = data
   } catch (error: any) {
-    Message.error(error?.message || '创建会话失败')
+    Message.error(getApiErrorMessage(error, '创建会话失败'))
   } finally {
     loading.value = false
   }
@@ -64,10 +65,10 @@ const fetchConversation = async () => {
   if (!conversation.value?.id) return
   loading.value = true
   try {
-    const data = await request.get(`/conversations/${conversation.value.id}`)
+    const data = await getConversation(conversation.value.id)
     conversation.value = data
   } catch (error: any) {
-    Message.error(error?.message || '加载会话失败')
+    Message.error(getApiErrorMessage(error, '加载会话失败'))
   } finally {
     loading.value = false
   }
@@ -249,7 +250,7 @@ const sendMessage = async () => {
       } else {
         conversation.value.messages.push({ role: 'assistant', content: '本次回复失败，请稍后重试。' })
       }
-      Message.error(error?.message || '发送失败')
+      Message.error(getApiErrorMessage(error, '发送失败'))
     }
   } finally {
     streamAbortController.value = null
@@ -330,13 +331,16 @@ watch(
 }
 
 .agent-panel {
-  background: #fff;
+  background: var(--glass-bg);
   border-radius: 16px;
   padding: 24px;
-  border: 1px solid #e5e6eb;
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-md);
   display: flex;
   flex-direction: column;
   gap: 16px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 
 .agent-banner {
@@ -347,14 +351,15 @@ watch(
   gap: 12px;
   padding: 16px 12px;
   border-radius: 12px;
-  background: linear-gradient(180deg, #eef2ff 0%, #ffffff 100%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: linear-gradient(180deg, rgba(109, 94, 248, 0.22) 0%, rgba(79, 140, 255, 0.12) 100%);
 }
 
 .agent-avatar {
   width: 64px;
   height: 64px;
   border-radius: 50%;
-  background: #2563eb;
+  background: linear-gradient(135deg, var(--brand-1), var(--brand-2));
   color: #fff;
   display: flex;
   align-items: center;
@@ -366,25 +371,29 @@ watch(
 .agent-title {
   font-size: 18px;
   font-weight: 600;
+  color: var(--text-1);
 }
 
 .agent-desc {
-  color: #6b7280;
+  color: var(--text-2);
   font-size: 13px;
 }
 
 .agent-hint {
   font-size: 13px;
-  color: #4b5563;
+  color: var(--text-2);
   line-height: 1.6;
 }
 
 .chat-panel {
-  background: #fff;
+  background: var(--glass-bg);
   border-radius: 16px;
-  border: 1px solid #e5e6eb;
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-md);
   display: flex;
   flex-direction: column;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 
 .chat-messages {
@@ -397,7 +406,7 @@ watch(
 }
 
 .empty-state {
-  color: #9ca3af;
+  color: var(--text-3);
   font-size: 13px;
 }
 
@@ -405,19 +414,22 @@ watch(
   max-width: 70%;
   padding: 12px 16px;
   border-radius: 12px;
-  background: #f3f4f6;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-1);
   align-self: flex-start;
 }
 
 .bubble.user {
-  background: #2563eb;
+  background: linear-gradient(135deg, rgba(109, 94, 248, 0.92), rgba(79, 140, 255, 0.92));
   color: #fff;
   align-self: flex-end;
+  border-color: transparent;
 }
 
 .bubble.assistant {
-  background: #f3f4f6;
-  color: #111827;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-1);
 }
 
 .role {
@@ -456,10 +468,11 @@ watch(
 
 .chat-input {
   padding: 16px 24px 24px;
-  border-top: 1px solid #e5e6eb;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
   display: flex;
   gap: 12px;
   align-items: flex-end;
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .chat-input :deep(.arco-textarea-wrapper) {

@@ -2,7 +2,6 @@
 import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { Message } from '@arco-design/web-vue'
-import request from '../utils/request'
 import { getAgents } from '../api/agents'
 
 interface AgentItem {
@@ -54,7 +53,15 @@ onMounted(fetchAgents)
 
 <template>
   <div class="agents-page">
-    <div class="toolbar">
+    <section class="hero glass-panel">
+      <div>
+        <div class="hero-title">智能体市场</div>
+        <div class="hero-subtitle">探索公共智能体，快速发起高质量对话。</div>
+      </div>
+      <a-tag color="arcoblue" bordered>Public Marketplace</a-tag>
+    </section>
+
+    <div class="toolbar glass-panel">
       <a-input-search
         v-model="keyword"
         placeholder="搜索智能体"
@@ -84,9 +91,41 @@ onMounted(fetchAgents)
   gap: 16px;
 }
 
+.glass-panel {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-md);
+  border-radius: var(--radius-xl);
+}
+
+.hero {
+  padding: 18px 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  background-image: linear-gradient(135deg, rgba(109, 94, 248, 0.26), rgba(39, 211, 195, 0.1));
+}
+
+.hero-title {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+
+.hero-subtitle {
+  margin-top: 6px;
+  color: var(--text-2);
+  font-size: 13px;
+}
+
 .toolbar {
   display: flex;
   justify-content: flex-end;
+  padding: 12px;
 }
 
 .agent-card {
@@ -94,10 +133,13 @@ onMounted(fetchAgents)
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .desc {
-  color: #6b7280;
+  color: var(--text-2);
   margin: 8px 0 16px;
 }
 </style>

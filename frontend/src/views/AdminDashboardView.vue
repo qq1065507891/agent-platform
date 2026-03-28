@@ -11,11 +11,13 @@ import {
   TooltipComponent,
 } from 'echarts/components'
 import VChart from 'vue-echarts'
+import { useAuthStore } from '../stores/auth'
+import { getUsers, type UserItem } from '../api/users'
 import {
   getMetricsAgents,
-  getMetricsErrors,
-  getMetricsSummary,
-  getMetricsTokens,
+  getMetricsSkills,
+  getMetricsOverview,
+  getMetricsTrends,
   type MetricsAgents,
   type MetricsErrorItem,
   type MetricsRangeParams,
@@ -36,10 +38,17 @@ use([
 
 const DASHBOARD_RANGE_KEY = 'admin_dashboard_range'
 
+const authStore = useAuthStore()
+const isAdmin = computed(() => authStore.user?.role === 'admin')
+
 const loading = ref(false)
 const range = ref<string[]>([])
 const errorMessage = ref('')
 const errorChartType = ref<'pie' | 'bar'>('pie')
+
+const scopeMode = ref<'all' | 'user'>('all')
+const selectedUserId = ref<string>('')
+const users = ref<UserItem[]>([])
 
 const quickRanges = [
   {
@@ -109,6 +118,16 @@ const getRangeParams = (): MetricsRangeParams => {
   }
 }
 
+const getScopeParams = (): Pick<MetricsRangeParams, 'scope' | 'user_id'> => {
+  if (!isAdmin.value) {
+    return { scope: 'self', user_id: authStore.user?.id }
+  }
+  if (scopeMode.value === 'user' && selectedUserId.value) {
+    return { scope: 'self', user_id: selectedUserId.value }
+  }
+  return { scope: 'all' }
+}
+
 const getPreviousRangeParams = (params: MetricsRangeParams): MetricsRangeParams | null => {
   if (!params.start_date || !params.end_date) return null
   const start = parseDate(params.start_date)
@@ -123,6 +142,7 @@ const getPreviousRangeParams = (params: MetricsRangeParams): MetricsRangeParams 
   return {
     start_date: formatDate(previousStart),
     end_date: formatDate(previousEnd),
+    ...getScopeParams(),
   }
 }
 
@@ -159,19 +179,40 @@ const p95DeltaClass = computed(() => {
   return 'delta-neutral'
 })
 
+const scopeLabel = computed(() => {
+  if (!isAdmin.value) return '数据范围：当前账号'
+  if (scopeMode.value === 'user' && selectedUserId.value) {
+    const hit = users.value.find((u) => u.id === selectedUserId.value)
+    return `数据范围：用户 ${hit?.username || selectedUserId.value}`
+  }
+  return '数据范围：全量（管理员）'
+})
+
+const loadUsers = async () => {
+  if (!isAdmin.value) return
+  try {
+    const response = await getUsers({ page: 1, page_size: 200 })
+    const data = (response as any)?.data ?? response
+    const list = Array.isArray(data?.list) ? data.list : []
+    users.value = list
+  } catch {
+    users.value = []
+  }
+}
+
 const fetchAll = async () => {
   loading.value = true
   errorMessage.value = ''
   try {
-    const params = getRangeParams()
+    const params = { ...getRangeParams(), ...getScopeParams() }
     const previousParams = getPreviousRangeParams(params)
 
     const [summaryData, errorsData, tokensData, agentsData, previousSummaryData] = await Promise.all([
-      getMetricsSummary(params),
-      getMetricsErrors(params),
-      getMetricsTokens(params),
+      getMetricsOverview(params),
+      getMetricsSkills(params),
+      getMetricsTrends(params),
       getMetricsAgents(params),
-      previousParams ? getMetricsSummary(previousParams) : Promise.resolve(null),
+      previousParams ? getMetricsOverview(previousParams) : Promise.resolve(null),
     ])
 
     summary.value = summaryData
@@ -196,19 +237,27 @@ const fetchAll = async () => {
 }
 
 const tokenLineOption = computed(() => ({
-  title: { text: '每日 Token 消耗趋势' },
+  title: { text: '每日 Token 消耗趋势', textStyle: { color: '#E9EEFF' } },
   tooltip: { trigger: 'axis' },
+  grid: { left: 40, right: 20, top: 55, bottom: 40 },
   xAxis: {
     type: 'category',
+    axisLabel: { color: '#9BA8CF' },
+    axisLine: { lineStyle: { color: '#30406A' } },
     data: tokenSeries.value.map((item) => item.date),
   },
-  yAxis: { type: 'value' },
+  yAxis: {
+    type: 'value',
+    axisLabel: { color: '#9BA8CF' },
+    splitLine: { lineStyle: { color: 'rgba(255,255,255,0.08)' } },
+  },
   series: [
     {
       type: 'line',
       smooth: true,
+      itemStyle: { color: '#6D5EF8' },
+      areaStyle: { color: 'rgba(109,94,248,0.28)' },
       data: tokenSeries.value.map((item) => item.tokens),
-      areaStyle: {},
     },
   ],
 }))
@@ -216,16 +265,24 @@ const tokenLineOption = computed(() => ({
 const errorOption = computed(() => {
   if (errorChartType.value === 'bar') {
     return {
-      title: { text: '请求错误分布（柱状图）' },
+      title: { text: '请求错误分布（柱状图）', textStyle: { color: '#E9EEFF' } },
       tooltip: { trigger: 'axis' },
+      grid: { left: 40, right: 20, top: 55, bottom: 40 },
       xAxis: {
         type: 'category',
+        axisLabel: { color: '#9BA8CF' },
+        axisLine: { lineStyle: { color: '#30406A' } },
         data: topErrors.value.map((item) => `${item.code}`),
       },
-      yAxis: { type: 'value' },
+      yAxis: {
+        type: 'value',
+        axisLabel: { color: '#9BA8CF' },
+        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.08)' } },
+      },
       series: [
         {
           type: 'bar',
+          itemStyle: { color: '#FF5D73' },
           data: topErrors.value.map((item) => item.count),
           barWidth: 24,
         },
@@ -234,9 +291,9 @@ const errorOption = computed(() => {
   }
 
   return {
-    title: { text: '请求错误分布（饼图）' },
+    title: { text: '请求错误分布（饼图）', textStyle: { color: '#E9EEFF' } },
     tooltip: { trigger: 'item' },
-    legend: { orient: 'vertical', right: 10, top: 'center' },
+    legend: { orient: 'vertical', right: 10, top: 'center', textStyle: { color: '#C9D3F2' } },
     series: [
       {
         type: 'pie',
@@ -267,6 +324,17 @@ const onRetry = () => {
   fetchAll()
 }
 
+const onScopeChange = () => {
+  if (scopeMode.value === 'all') {
+    selectedUserId.value = ''
+  }
+  fetchAll()
+}
+
+const onTargetUserChange = () => {
+  fetchAll()
+}
+
 const escapeCsvValue = (value: string | number) => {
   const text = String(value ?? '')
   if (text.includes(',') || text.includes('"') || text.includes('\n')) {
@@ -287,6 +355,7 @@ const exportCsv = () => {
   }
 
   lines.push('模块,指标,值')
+  lines.push(`范围,当前范围,${scopeLabel.value}`)
   lines.push(`汇总,P95延迟(ms),${summary.value.p95_ms}`)
   lines.push(`汇总,成功率(%),${(summary.value.success_rate * 100).toFixed(2)}`)
   lines.push(`汇总,Token总量,${summary.value.token_total}`)
@@ -325,7 +394,9 @@ const exportCsv = () => {
   Message.success('CSV 导出成功')
 }
 
-onMounted(() => {
+onMounted(async () => {
+  await loadUsers()
+
   const saved = loadSavedRange()
   if (saved) {
     range.value = saved
@@ -338,19 +409,51 @@ onMounted(() => {
 
 <template>
   <div class="dashboard-page">
-    <a-card class="filters" :bordered="false">
+    <section class="hero glass-panel">
+      <div>
+        <div class="hero-title">品牌运营总览</div>
+        <div class="hero-subtitle">从性能、稳定性到业务增长，一屏掌控全局健康度。</div>
+      </div>
+      <a-tag color="arcoblue" bordered>{{ scopeLabel }}</a-tag>
+    </section>
+
+    <a-card class="filters glass-panel" :bordered="false">
       <div class="filters-row">
-        <div class="quick-range-buttons">
+        <div class="quick-range-buttons force-black-text">
           <a-button
             v-for="item in quickRanges"
             :key="item.value"
+            class="quick-range-btn"
             size="small"
             @click="applyQuickRange(item.value)"
           >
             {{ item.label }}
           </a-button>
         </div>
-        <a-range-picker v-model="range" format="YYYY-MM-DD" @change="onRangeChange" />
+
+        <template v-if="isAdmin">
+          <a-radio-group v-model="scopeMode" type="button" size="small" @change="onScopeChange">
+            <a-radio value="all">全量数据</a-radio>
+            <a-radio value="user">按用户查看</a-radio>
+          </a-radio-group>
+
+          <a-select
+            v-if="scopeMode === 'user'"
+            v-model="selectedUserId"
+            :options="users.map((u) => ({ label: `${u.username} (${u.email})`, value: u.id }))"
+            allow-search
+            placeholder="选择用户"
+            style="width: 280px"
+            @change="onTargetUserChange"
+          />
+        </template>
+
+        <a-range-picker
+          v-model="range"
+          format="YYYY-MM-DD"
+          popup-class-name="dashboard-range-popup"
+          @change="onRangeChange"
+        />
         <a-button type="outline" size="small" @click="exportCsv">导出 CSV</a-button>
       </div>
     </a-card>
@@ -364,13 +467,13 @@ onMounted(() => {
     <a-spin :loading="loading" style="width: 100%">
       <a-grid :cols="4" :col-gap="16" :row-gap="16" class="summary-grid">
         <a-grid-item>
-          <a-card>
+          <a-card class="glass-card">
             <a-statistic title="P95 延迟" :value="summary.p95_ms" :precision="0" suffix="ms" />
             <div class="delta-text" :class="p95DeltaClass">{{ p95DeltaText }}</div>
           </a-card>
         </a-grid-item>
         <a-grid-item>
-          <a-card>
+          <a-card class="glass-card">
             <a-statistic
               title="成功率"
               :value="summary.success_rate * 100"
@@ -381,12 +484,12 @@ onMounted(() => {
           </a-card>
         </a-grid-item>
         <a-grid-item>
-          <a-card>
+          <a-card class="glass-card">
             <a-statistic title="Token 总量" :value="summary.token_total" :precision="0" />
           </a-card>
         </a-grid-item>
         <a-grid-item>
-          <a-card>
+          <a-card class="glass-card">
             <a-statistic title="Agent 创建量" :value="summary.agent_created" :precision="0" />
           </a-card>
         </a-grid-item>
@@ -394,13 +497,13 @@ onMounted(() => {
 
       <a-grid :cols="2" :col-gap="16" class="charts-grid">
         <a-grid-item>
-          <a-card>
+          <a-card class="glass-card">
             <VChart v-if="tokenSeries.length" :option="tokenLineOption" autoresize style="height: 360px" />
             <a-empty v-else description="当前时间范围暂无 Token 数据" />
           </a-card>
         </a-grid-item>
         <a-grid-item>
-          <a-card>
+          <a-card class="glass-card">
             <template #title>
               <div class="chart-title-row">
                 <span>请求错误分布</span>
@@ -418,17 +521,17 @@ onMounted(() => {
 
       <a-grid :cols="3" :col-gap="16" class="agent-metrics-grid">
         <a-grid-item>
-          <a-card>
+          <a-card class="glass-card">
             <a-statistic title="活跃使用用户(去重)" :value="agentStats.used" :precision="0" />
           </a-card>
         </a-grid-item>
         <a-grid-item>
-          <a-card>
+          <a-card class="glass-card">
             <a-statistic title="创建 Agent 数" :value="agentStats.created" :precision="0" />
           </a-card>
         </a-grid-item>
         <a-grid-item>
-          <a-card>
+          <a-card class="glass-card">
             <a-statistic
               title="7日留存率"
               :value="agentStats.retention_7d * 100"
@@ -449,11 +552,46 @@ onMounted(() => {
   gap: 16px;
 }
 
+.glass-panel {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-md);
+  border-radius: var(--radius-xl);
+}
+
+.hero {
+  padding: 20px 22px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background-image: linear-gradient(135deg, rgba(109, 94, 248, 0.24), rgba(79, 140, 255, 0.16));
+}
+
+.hero-title {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+
+.hero-subtitle {
+  margin-top: 6px;
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+.filters {
+  background: rgba(18, 28, 56, 0.7);
+}
+
 .filters-row {
   display: flex;
   justify-content: flex-end;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .quick-range-buttons {
@@ -461,11 +599,24 @@ onMounted(() => {
   gap: 8px;
 }
 
+.force-black-text,
+.force-black-text :deep(*),
+.force-black-text :deep(.arco-btn),
+.force-black-text :deep(.arco-btn-content) {
+  color: #111827 !important;
+}
+
 .chart-title-row {
   width: 100%;
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+
+.glass-card {
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .summary-grid,
@@ -480,14 +631,108 @@ onMounted(() => {
 }
 
 .delta-up {
-  color: rgb(var(--success-6));
+  color: #27d3c3;
 }
 
 .delta-down {
-  color: rgb(var(--danger-6));
+  color: #ff5d73;
 }
 
 .delta-neutral {
-  color: rgb(var(--gray-6));
+  color: var(--text-3);
+}
+
+/* 指定区域：文字改为黑色（按截图框选控件） */
+:deep(.hero .arco-tag),
+:deep(.filters-row .arco-btn),
+:deep(.filters-row .arco-btn .arco-btn-content),
+:deep(.filters-row .arco-radio-button),
+:deep(.filters-row .arco-radio-label),
+:deep(.filters-row .arco-select-view-value),
+:deep(.filters-row .arco-picker),
+:deep(.filters-row .arco-picker input),
+:deep(.chart-title-row .arco-radio-button),
+:deep(.chart-title-row .arco-radio-label) {
+  color: #111827 !important;
+}
+
+:deep(.filters-row .arco-btn),
+:deep(.filters-row .arco-radio-button),
+:deep(.filters-row .arco-radio-button .arco-radio-button-content),
+:deep(.filters-row .arco-radio-button .arco-radio-label),
+:deep(.filters-row .arco-radio-button.arco-radio-checked),
+:deep(.filters-row .arco-radio-button.arco-radio-checked .arco-radio-button-content),
+:deep(.filters-row .arco-radio-button.arco-radio-checked .arco-radio-label),
+:deep(.filters-row .arco-select-view),
+:deep(.filters-row .arco-picker),
+:deep(.hero .arco-tag),
+:deep(.chart-title-row .arco-radio-button),
+:deep(.chart-title-row .arco-radio-button .arco-radio-button-content),
+:deep(.chart-title-row .arco-radio-button .arco-radio-label),
+:deep(.chart-title-row .arco-radio-button.arco-radio-checked),
+:deep(.chart-title-row .arco-radio-button.arco-radio-checked .arco-radio-button-content),
+:deep(.chart-title-row .arco-radio-button.arco-radio-checked .arco-radio-label) {
+  background: rgba(255, 255, 255, 0.95) !important;
+  border-color: rgba(0, 0, 0, 0.38) !important;
+  color: #111827 !important;
+}
+
+/* 快捷范围按钮（你最新截图这一块） */
+.quick-range-btn,
+.quick-range-btn :deep(*) {
+  color: #111827 !important;
+}
+
+.quick-range-btn:deep(.arco-btn),
+.quick-range-btn:deep(.arco-btn-content),
+:deep(.quick-range-btn.arco-btn),
+:deep(.quick-range-btn .arco-btn-content) {
+  color: #111827 !important;
+  background: rgba(255, 255, 255, 0.96) !important;
+  border-color: rgba(0, 0, 0, 0.45) !important;
+}
+
+:deep(.quick-range-btn.arco-btn:hover),
+:deep(.quick-range-btn.arco-btn:focus),
+:deep(.quick-range-btn.arco-btn:active) {
+  color: #111827 !important;
+  background: #ffffff !important;
+  border-color: rgba(0, 0, 0, 0.65) !important;
+}
+
+/* 日期范围输入框（你截图第一个红框） */
+:deep(.filters-row .arco-picker input),
+:deep(.filters-row .arco-picker input::placeholder),
+:deep(.filters-row .arco-picker .arco-picker-suffix-icon),
+:deep(.filters-row .arco-picker .arco-picker-clear-icon) {
+  color: #111827 !important;
+}
+
+/* 错误分布切换按钮（你截图第二个红框） */
+:deep(.chart-title-row .arco-radio-button),
+:deep(.chart-title-row .arco-radio-button *),
+:deep(.chart-title-row .arco-radio),
+:deep(.chart-title-row .arco-radio *) {
+  color: #111827 !important;
+}
+
+:deep(.chart-title-row .arco-radio-button.arco-radio-checked) {
+  background: #ffffff !important;
+  border-color: rgba(0, 0, 0, 0.45) !important;
+}
+
+/* 日期弹层（红框区域）文字改为黑色
+   注意：弹层挂载在 body（teleport），scoped + deep 选不中，所以改用 :global */
+:global(.dashboard-range-popup),
+:global(.dashboard-range-popup *),
+:global(.dashboard-range-popup .arco-picker-date-value),
+:global(.dashboard-range-popup .arco-picker-cell),
+:global(.dashboard-range-popup .arco-picker-header-title),
+:global(.dashboard-range-popup .arco-picker-header-label),
+:global(.dashboard-range-popup .arco-picker-week-list-item),
+:global(.dashboard-range-popup .arco-picker-cell-in-view .arco-picker-date-value),
+:global(.dashboard-range-popup .arco-picker-cell-in-range .arco-picker-date-value),
+:global(.dashboard-range-popup .arco-picker-cell-selected .arco-picker-date-value) {
+  color: #111827 !important;
 }
 </style>

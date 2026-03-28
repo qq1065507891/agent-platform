@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { Message } from '@arco-design/web-vue'
 import { getRoles } from '../api/roles'
+import { getApiErrorMessage } from '../utils/request'
 
 interface RoleRow {
   id?: string
@@ -31,8 +32,8 @@ const fetchRoles = async () => {
     const data = await getRoles()
     const list = Array.isArray(data) ? data : data?.list
     roles.value = (list || []).map((item: RoleRow) => normalizeRow(item))
-  } catch (error: any) {
-    Message.error(error?.message || '获取角色失败')
+  } catch (error: unknown) {
+    Message.error(getApiErrorMessage(error, '获取角色失败'))
   } finally {
     loading.value = false
   }
@@ -45,14 +46,14 @@ onMounted(fetchRoles)
 
 <template>
   <div class="admin-page">
-    <div class="page-header">
+    <section class="hero glass-panel">
       <div>
         <div class="title">角色管理</div>
         <div class="subtitle">查看角色权限清单</div>
       </div>
-    </div>
+    </section>
 
-    <a-table
+    <a-table class="table"
       :data="safeRoles"
       :columns="columns"
       :pagination="false"
@@ -75,20 +76,39 @@ onMounted(fetchRoles)
   gap: 16px;
 }
 
-.page-header {
+.glass-panel {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-md);
+  border-radius: var(--radius-xl);
+}
+
+.hero {
+  padding: 18px 20px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
+  background-image: linear-gradient(135deg, rgba(109, 94, 248, 0.22), rgba(79, 140, 255, 0.12));
 }
 
 .title {
-  font-size: 18px;
-  font-weight: 600;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-1);
 }
 
 .subtitle {
-  color: #6b7280;
-  font-size: 12px;
+  color: var(--text-2);
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.table {
+  border-radius: 14px;
+  overflow: hidden;
 }
 </style>

@@ -1,0 +1,38 @@
+# VCS
+.git
+.gitignore
+
+# Python cache / virtual env
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+
+# Test / tooling cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local env and IDE
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+
+# Local runtime artifacts
+chroma/
+*.sqlite3
+*.db
+logs/
+
+# Frontend artifacts
+frontend/node_modules/
+frontend/dist/
+
+# Docs / misc
+terminals/

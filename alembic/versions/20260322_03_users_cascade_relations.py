@@ -17,7 +17,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.drop_constraint("agents_owner_id_fkey", "agents", type_="foreignkey")
+    op.execute("ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_owner_id_fkey")
     op.create_foreign_key(
         "agents_owner_id_fkey",
         "agents",
@@ -27,7 +27,7 @@ def upgrade() -> None:
         ondelete="CASCADE",
     )
 
-    op.drop_constraint("conversations_user_id_fkey", "conversations", type_="foreignkey")
+    op.execute("ALTER TABLE conversations DROP CONSTRAINT IF EXISTS conversations_user_id_fkey")
     op.create_foreign_key(
         "conversations_user_id_fkey",
         "conversations",
@@ -39,7 +39,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_constraint("conversations_user_id_fkey", "conversations", type_="foreignkey")
+    op.execute("ALTER TABLE conversations DROP CONSTRAINT IF EXISTS conversations_user_id_fkey")
     op.create_foreign_key(
         "conversations_user_id_fkey",
         "conversations",
@@ -48,7 +48,7 @@ def downgrade() -> None:
         ["id"],
     )
 
-    op.drop_constraint("agents_owner_id_fkey", "agents", type_="foreignkey")
+    op.execute("ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_owner_id_fkey")
     op.create_foreign_key(
         "agents_owner_id_fkey",
         "agents",

@@ -2,19 +2,28 @@
 import { computed, h, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Message, Modal } from '@arco-design/web-vue'
-import request from '../utils/request'
+import { getAgentDetail } from '../api/agents'
 import {
   deleteConversation,
-  getAgentDetail,
-  listUserConversations,
+  getConversation,
+  listConversations,
   renameConversation,
-} from '../api/agents'
+} from '../api/conversations'
+import { getApiErrorMessage } from '../utils/request'
+
+interface MessageSource {
+  doc_id?: string
+  source?: string
+  version?: number | string
+  chunk_index?: number | string
+}
 
 interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
   pending?: boolean
   interrupted?: boolean
+  sources?: MessageSource[]
 }
 
 interface Conversation {
@@ -65,6 +74,12 @@ const contextMenu = ref({
   item: null as Conversation | null,
 })
 
+const toTimestamp = (value?: string) => {
+  if (!value) return 0
+  const ts = new Date(value).getTime()
+  return Number.isFinite(ts) ? ts : 0
+}
+
 const historyGroups = computed(() => {
   const map: Record<string, { agent_id: string; agent_name?: string; agent_description?: string; items: Conversation[] }> = {}
   historyList.value.forEach((item) => {
@@ -79,10 +94,19 @@ const historyGroups = computed(() => {
     }
     map[key].items.push(item)
   })
-  return Object.values(map).map((group) => ({
+
+  const groups = Object.values(map).map((group) => ({
     ...group,
-    items: group.items.sort((a, b) => (a.id > b.id ? -1 : 1)),
+    items: [...group.items].sort((a, b) => toTimestamp(b.created_at) - toTimestamp(a.created_at)),
   }))
+
+  groups.sort((a, b) => {
+    const aLatest = a.items.length ? toTimestamp(a.items[0].created_at) : 0
+    const bLatest = b.items.length ? toTimestamp(b.items[0].created_at) : 0
+    return bLatest - aLatest
+  })
+
+  return groups
 })
 
 const toggleAgentGroup = (agentId: string) => {
@@ -100,13 +124,13 @@ const fetchConversation = async () => {
   if (!conversationId.value || conversationId.value === 'placeholder') return
   loading.value = true
   try {
-    const data = await request.get(`/conversations/${conversationId.value}`)
+    const data = await getConversation(conversationId.value)
     conversation.value = data
     if (data?.agent_id) {
       agentInfo.value = await getAgentDetail(data.agent_id)
     }
   } catch (error: any) {
-    Message.error(error?.message || '加载会话失败')
+    Message.error(getApiErrorMessage(error, '加载会话失败'))
   } finally {
     loading.value = false
   }
@@ -114,10 +138,10 @@ const fetchConversation = async () => {
 
 const fetchHistoryList = async () => {
   try {
-    const data = await listUserConversations()
-    historyList.value = data
+    const data = await listConversations()
+    historyList.value = Array.isArray(data) ? data : []
   } catch (error: any) {
-    Message.error(error?.message || '加载历史对话失败')
+    Message.error(getApiErrorMessage(error, '加载历史对话失败'))
   }
 }
 
@@ -134,6 +158,7 @@ const hideContextMenu = () => {
 
 const onConversationContextMenu = (event: MouseEvent, item: Conversation) => {
   event.preventDefault()
+  event.stopPropagation()
   const menuWidth = 140
   const menuHeight = 44
   const padding = 8
@@ -207,7 +232,6 @@ const onRenameConversation = () => {
 
 const onDeleteConversation = () => {
   const item = contextMenu.value.item
-  hideContextMenu()
   if (!item?.id) return
 
   Modal.confirm({
@@ -217,6 +241,7 @@ const onDeleteConversation = () => {
     onOk: async () => {
       if (deletingConversationId.value) return
       deletingConversationId.value = item.id
+      hideContextMenu()
       try {
         await deleteConversation(item.id)
         Message.success('会话已删除')
@@ -232,6 +257,9 @@ const onDeleteConversation = () => {
       } finally {
         deletingConversationId.value = ''
       }
+    },
+    onCancel: () => {
+      hideContextMenu()
     },
   })
 }
@@ -313,6 +341,33 @@ const sendMessage = async () => {
     const decoder = new TextDecoder('utf-8')
     let buffer = ''
     let fullText = ''
+    let doneSources: MessageSource[] = []
+    let streamDone = false
+    const streamIdleTimeoutMs = 3000
+    let streamIdleTimer: ReturnType<typeof setTimeout> | null = null
+
+    const scheduleStreamIdleGuard = () => {
+      if (streamIdleTimer) {
+        clearTimeout(streamIdleTimer)
+      }
+      streamIdleTimer = setTimeout(async () => {
+        if (streamDone || !fullText.trim()) return
+        console.warn('[chat-stream] idle timeout reached, force finishing stream')
+        streamDone = true
+        try {
+          await reader.cancel()
+        } catch {
+          // ignore cancel race
+        }
+      }, streamIdleTimeoutMs)
+    }
+
+    const clearStreamIdleGuard = () => {
+      if (streamIdleTimer) {
+        clearTimeout(streamIdleTimer)
+        streamIdleTimer = null
+      }
+    }
 
     const setPendingText = async (text: string) => {
       const pendingIndex = conversation.value!.messages.findIndex((m) => m.pending)
@@ -322,15 +377,20 @@ const sendMessage = async () => {
       }
     }
 
+    scheduleStreamIdleGuard()
+
     while (true) {
+      if (streamDone) break
       const { done, value } = await reader.read()
       if (done) break
+      scheduleStreamIdleGuard()
 
       buffer += decoder.decode(value, { stream: true })
       const chunks = buffer.split('\n\n')
       buffer = chunks.pop() || ''
 
       for (const chunk of chunks) {
+        if (streamDone) break
         const line = chunk
           .split('\n')
           .find((item) => item.startsWith('data: '))
@@ -363,18 +423,33 @@ const sendMessage = async () => {
           await setPendingText(fullText)
         }
 
-        if (payload.type === 'done') {
-          fullText = payload.assistant_message || fullText
+        if (payload.type === 'done' || payload.type === 'final') {
+          fullText = payload.assistant_message || payload.content || fullText
+          doneSources = Array.isArray(payload.sources) ? payload.sources : []
+          streamDone = true
+          clearStreamIdleGuard()
+          try {
+            await reader.cancel()
+          } catch {
+            // ignore cancel race
+          }
+          break
         }
       }
+    }
+
+    clearStreamIdleGuard()
+
+    if (!streamDone) {
+      console.warn('[chat-stream] stream ended without explicit done/final event')
     }
 
     const finalReply = fullText.trim() || '已收到你的消息，但当前没有生成文本回复。'
     const pendingIndex = conversation.value.messages.findIndex((m) => m.pending)
     if (pendingIndex >= 0) {
-      conversation.value.messages[pendingIndex] = { role: 'assistant', content: finalReply }
+      conversation.value.messages[pendingIndex] = { role: 'assistant', content: finalReply, sources: doneSources }
     } else {
-      conversation.value.messages.push({ role: 'assistant', content: finalReply })
+      conversation.value.messages.push({ role: 'assistant', content: finalReply, sources: doneSources })
     }
 
     if (enableStreamMetrics) {
@@ -416,7 +491,7 @@ const sendMessage = async () => {
       } else {
         conversation.value.messages.push({ role: 'assistant', content: '本次回复失败，请稍后重试。' })
       }
-      Message.error(error?.message || '发送失败')
+      Message.error(getApiErrorMessage(error, '发送失败'))
     }
   } finally {
     streamAbortController.value = null
@@ -508,6 +583,20 @@ watch(
               {{ msg.content }}
               <span v-if="msg.pending" class="typing-cursor" aria-hidden="true"></span>
               <span v-if="msg.interrupted && !msg.pending" class="interrupted-tag">（已中断）</span>
+
+              <details v-if="msg.role === 'assistant' && msg.sources && msg.sources.length" class="sources-panel">
+                <summary>引用来源（{{ msg.sources.length }}）</summary>
+                <ul class="sources-list">
+                  <li v-for="(src, sidx) in msg.sources" :key="`${src.doc_id || 'doc'}-${src.chunk_index || sidx}-${sidx}`">
+                    <div class="source-line">
+                      <strong>{{ src.source || '未命名文档' }}</strong>
+                      <span v-if="src.version !== undefined" class="source-meta">v{{ src.version }}</span>
+                      <span v-if="src.chunk_index !== undefined" class="source-meta">#{{ src.chunk_index }}</span>
+                    </div>
+                    <div v-if="src.doc_id" class="source-id">{{ src.doc_id }}</div>
+                  </li>
+                </ul>
+              </details>
             </div>
           </div>
         </div>
@@ -529,6 +618,7 @@ watch(
       class="context-menu"
       :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }"
       @click.stop
+      @contextmenu.prevent.stop
     >
       <a-button
         type="text"
@@ -579,11 +669,11 @@ watch(
 .context-menu {
   position: fixed;
   z-index: 2000;
-  min-width: 120px;
-  background: #ffffff;
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.18);
+  min-width: 130px;
+  background: rgba(18, 28, 56, 0.95);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-lg);
   padding: 6px;
 }
 
@@ -592,21 +682,35 @@ watch(
   justify-content: flex-start;
 }
 
+.chat-sidebar,
+.chat-main {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-md);
+}
+
 .chat-sidebar {
-  width: 260px;
-  background: #fff;
-  border-radius: 14px;
+  background: rgba(30, 45, 86, 0.68);
+}
+
+.chat-main {
+  background: rgba(74, 101, 170, 0.26);
+}
+
+.chat-sidebar {
+  width: 300px;
+  border-radius: var(--radius-xl);
   padding: 16px;
-  border: 1px solid #e5e6eb;
-  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
 .sidebar-title {
-  font-weight: 600;
+  font-weight: 700;
   margin-bottom: 12px;
+  color: var(--text-1);
 }
 
 .history-list {
@@ -629,15 +733,15 @@ watch(
   align-items: center;
   padding: 10px 12px;
   border-radius: 12px;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   gap: 12px;
   transition: all 0.2s ease;
 }
 
 .history-group-header:hover {
-  border-color: #c7d2fe;
-  background: #eef2ff;
+  border-color: rgba(109, 94, 248, 0.8);
+  background: rgba(109, 94, 248, 0.22);
 }
 
 .history-group-main {
@@ -652,7 +756,7 @@ watch(
   width: 32px;
   height: 32px;
   border-radius: 50%;
-  background: #4f46e5;
+  background: linear-gradient(135deg, var(--brand-1), var(--brand-2));
   color: #fff;
   display: flex;
   align-items: center;
@@ -671,7 +775,7 @@ watch(
 .history-title {
   font-size: 13px;
   font-weight: 600;
-  color: #111827;
+  color: var(--text-1);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -679,7 +783,7 @@ watch(
 
 .history-meta {
   font-size: 12px;
-  color: #6b7280;
+  color: var(--text-3);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -688,13 +792,6 @@ watch(
 .history-toggle {
   border-radius: 999px;
   padding: 0 12px;
-  color: #4338ca;
-  border-color: #c7d2fe;
-}
-
-.history-toggle:hover {
-  color: #312e81;
-  border-color: #a5b4fc;
 }
 
 .history-items {
@@ -704,21 +801,22 @@ watch(
 }
 
 .history-item {
-  border: 1px solid #e5e7eb;
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 10px;
-  padding: 8px 12px;
-  background: #fff;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.06);
   cursor: pointer;
   transition: all 0.2s ease;
 }
 
 .history-item:hover {
-  border-color: #c7d2fe;
-  background: #f8fafc;
+  border-color: rgba(109, 94, 248, 0.85);
+  background: rgba(109, 94, 248, 0.24);
+  transform: translateY(-1px);
 }
 
 .placeholder {
-  color: #9ca3af;
+  color: var(--text-3);
   font-size: 13px;
 }
 
@@ -726,24 +824,23 @@ watch(
   flex: 1;
   display: flex;
   flex-direction: column;
-  background: #fff;
-  border-radius: 12px;
-  border: 1px solid #e5e6eb;
+  border-radius: var(--radius-xl);
 }
 
 .agent-header {
   display: flex;
   gap: 12px;
-  padding: 16px 24px;
-  border-bottom: 1px solid #e5e6eb;
+  padding: 18px 24px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
   align-items: center;
+  background: linear-gradient(135deg, rgba(109, 94, 248, 0.25), rgba(39, 211, 195, 0.1));
 }
 
 .agent-avatar {
   width: 42px;
   height: 42px;
   border-radius: 50%;
-  background: #1d4ed8;
+  background: linear-gradient(135deg, var(--brand-1), var(--brand-2));
   color: #fff;
   display: flex;
   align-items: center;
@@ -759,12 +856,13 @@ watch(
 }
 
 .agent-name {
-  font-weight: 600;
+  font-weight: 700;
   font-size: 16px;
+  color: var(--text-1);
 }
 
 .agent-desc {
-  color: #6b7280;
+  color: #e4ebff;
   font-size: 13px;
 }
 
@@ -773,33 +871,41 @@ watch(
   padding: 24px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 18px;
   overflow-y: auto;
 }
 
 .bubble {
-  max-width: 70%;
-  padding: 12px 16px;
-  border-radius: 12px;
-  background: #f3f4f6;
+  max-width: 74%;
+  padding: 13px 16px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.16);
   align-self: flex-start;
+  color: #f3f6ff;
 }
 
 .bubble.user {
-  background: #2563eb;
+  background: linear-gradient(135deg, rgba(109, 94, 248, 0.9), rgba(79, 140, 255, 0.9));
   color: #fff;
   align-self: flex-end;
+  border-color: transparent;
 }
 
 .bubble.assistant {
-  background: #f3f4f6;
-  color: #111827;
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text-1);
 }
 
 .role {
   font-size: 12px;
-  opacity: 0.7;
-  margin-bottom: 6px;
+  opacity: 0.86;
+  margin-bottom: 7px;
+}
+
+.content {
+  line-height: 1.68;
+  letter-spacing: 0.1px;
 }
 
 .typing-cursor {
@@ -816,7 +922,7 @@ watch(
 .interrupted-tag {
   margin-left: 6px;
   font-size: 12px;
-  color: #9ca3af;
+  color: var(--text-3);
 }
 
 @keyframes blink {
@@ -824,6 +930,7 @@ watch(
   49% {
     opacity: 0.85;
   }
+
   50%,
   100% {
     opacity: 0;
@@ -831,14 +938,74 @@ watch(
 }
 
 .chat-input {
-  padding: 16px 24px 24px;
-  border-top: 1px solid #e5e6eb;
+  padding: 16px 24px 22px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
   display: flex;
   gap: 12px;
   align-items: flex-end;
+  background: rgba(255, 255, 255, 0.03);
+  box-shadow: inset 0 8px 28px rgba(109, 94, 248, 0.08);
 }
 
 .chat-input :deep(.arco-textarea-wrapper) {
   flex: 1;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.chat-input :deep(.arco-textarea-wrapper:hover),
+.chat-input :deep(.arco-textarea-wrapper.arco-textarea-focus) {
+  border-color: rgba(109, 94, 248, 0.75) !important;
+  box-shadow: 0 0 0 3px rgba(109, 94, 248, 0.18);
+}
+
+.chat-input :deep(.arco-btn-primary) {
+  transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease;
+  background: linear-gradient(135deg, #7967ff, #52a7ff) !important;
+  box-shadow: 0 14px 30px rgba(82, 167, 255, 0.42);
+}
+
+.chat-input :deep(.arco-btn-primary:hover) {
+  transform: translateY(-1px);
+  filter: brightness(1.08);
+  box-shadow: 0 18px 34px rgba(82, 167, 255, 0.5);
+}
+
+.sources-panel {
+  margin-top: 10px;
+  border: 1px solid rgba(39, 211, 195, 0.35);
+  background: rgba(39, 211, 195, 0.08);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.sources-panel summary {
+  cursor: pointer;
+  color: #7ae9de;
+  font-weight: 600;
+  outline: none;
+}
+
+.sources-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.source-line {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  color: var(--text-2);
+}
+
+.source-meta {
+  color: var(--text-3);
+}
+
+.source-id {
+  color: var(--text-3);
+  font-size: 11px;
+  margin-top: 2px;
+  word-break: break-all;
 }
 </style>

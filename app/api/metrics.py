@@ -1,208 +1,209 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy import Float, and_, case, cast, distinct, func
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_db, require_admin
+from app.core.deps import get_current_user, get_db
 from app.core.responses import success_response
-from app.models.agent import Agent
-from app.models.event_log import EventLog
-from app.models.llm_usage import LLMUsage
-from app.models.request_log import RequestLog
+from app.models.user import User
+from app.observability.context import get_trace_id
+from app.observability.service import ObservabilityService
 from app.schemas.common import APIResponse
-from app.schemas.metrics import MetricsAgents, MetricsErrorItem, MetricsErrors, MetricsSummary, MetricsTokenItem
+from app.schemas.metrics import MetricsAgents, MetricsErrors, MetricsSummary, MetricsTokenItem
+from app.services.metrics import MetricsQueryScope, MetricsService
 
 router = APIRouter(prefix="/metrics", tags=["metrics"])
 
 
-def _parse_window(start_date: str | None, end_date: str | None) -> tuple[datetime, datetime]:
-    now = datetime.now(timezone.utc)
-    if start_date and end_date:
-        start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
-        end = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
+_ALLOWED_SCOPE = {"all", "self"}
+
+
+def _resolve_metrics_scope(
+    *,
+    current_user: User,
+    requested_scope: str | None,
+    requested_user_id: str | None,
+    start_date: str | None,
+    end_date: str | None,
+) -> MetricsQueryScope:
+    parsed_scope = (requested_scope or "self").strip().lower() or "self"
+    if parsed_scope not in _ALLOWED_SCOPE:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="scope 参数非法")
+
+    normalized_target_user_id = (requested_user_id or "").strip() or None
+
+    if current_user.role != "admin":
+        if normalized_target_user_id and normalized_target_user_id != current_user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限查看其他用户指标")
+
+        scope_value = "self"
+        target_user_id = current_user.id
     else:
-        end = now
-        start = now - timedelta(days=7)
-    if end < start:
-        start, end = end, start
-    return start, end
+        scope_value = parsed_scope
+        target_user_id = normalized_target_user_id
+
+    start, end = MetricsService.parse_window(start_date, end_date)
+    return MetricsQueryScope(
+        current_user_id=current_user.id,
+        role=current_user.role,
+        scope=scope_value,  # type: ignore[arg-type]
+        target_user_id=target_user_id,
+        start=start,
+        end=end,
+    )
 
 
-@router.get("/summary", response_model=APIResponse)
-def get_metrics_summary(
+def _audit_admin_all_scope_if_needed(
+    *,
+    db: Session,
+    current_user: User,
+    scope: MetricsQueryScope,
+    endpoint: str,
+) -> None:
+    if current_user.role != "admin":
+        return
+    if scope.effective_scope != "all":
+        return
+
+    ObservabilityService(db).log_event(
+        event_type="metrics_admin_view",
+        user_id=current_user.id,
+        metadata={
+            "scope": scope.effective_scope,
+            "filters": scope.filters,
+            "endpoint": endpoint,
+            "trace_id": get_trace_id(),
+            "cache_scope_key": scope.cache_scope_key,
+        },
+    )
+
+
+@router.get("/overview", response_model=APIResponse)
+def get_metrics_overview(
+    scope: str | None = Query("self", description="self/all，all 仅管理员可用"),
     start_date: str | None = Query(None, description="ISO 日期，例如 2026-03-01"),
     end_date: str | None = Query(None, description="ISO 日期，例如 2026-03-22"),
+    user_id: str | None = Query(None, description="仅管理员可指定某用户"),
     db: Session = Depends(get_db),
-    _admin=Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ) -> APIResponse:
-    start, end = _parse_window(start_date, end_date)
-
-    window_filter = and_(RequestLog.created_at >= start, RequestLog.created_at <= end)
-
-    p95_ms = (
-        db.query(func.percentile_cont(0.95).within_group(RequestLog.latency_ms))
-        .filter(window_filter)
-        .scalar()
+    query_scope = _resolve_metrics_scope(
+        current_user=current_user,
+        requested_scope=scope,
+        requested_user_id=user_id,
+        start_date=start_date,
+        end_date=end_date,
     )
+    _audit_admin_all_scope_if_needed(db=db, current_user=current_user, scope=query_scope, endpoint="overview")
 
-    total_requests = db.query(func.count(RequestLog.id)).filter(window_filter).scalar() or 0
-    success_requests = (
-        db.query(func.count(RequestLog.id))
-        .filter(window_filter, RequestLog.status_code >= 200, RequestLog.status_code < 400)
-        .scalar()
-        or 0
+    data = MetricsService(db).get_overview(query_scope)
+    payload = MetricsSummary(**data).model_dump()
+    return success_response(payload)
+
+
+@router.get("/trends", response_model=APIResponse)
+def get_metrics_trends(
+    scope: str | None = Query("self", description="self/all，all 仅管理员可用"),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user_id: str | None = Query(None, description="仅管理员可指定某用户"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> APIResponse:
+    query_scope = _resolve_metrics_scope(
+        current_user=current_user,
+        requested_scope=scope,
+        requested_user_id=user_id,
+        start_date=start_date,
+        end_date=end_date,
     )
-    success_rate = float(success_requests / total_requests) if total_requests else 0.0
+    _audit_admin_all_scope_if_needed(db=db, current_user=current_user, scope=query_scope, endpoint="trends")
 
-    token_total = (
-        db.query(func.coalesce(func.sum(LLMUsage.total_tokens), 0))
-        .filter(LLMUsage.created_at >= start, LLMUsage.created_at <= end)
-        .scalar()
-        or 0
-    )
-
-    agent_created = (
-        db.query(func.count(Agent.id))
-        .filter(
-            Agent.created_at >= start,
-            Agent.created_at <= end,
-            Agent.status.in_(["draft", "published"]),
-        )
-        .scalar()
-        or 0
-    )
-
-    data = MetricsSummary(
-        p95_ms=float(p95_ms or 0),
-        success_rate=success_rate,
-        token_total=int(token_total),
-        agent_created=int(agent_created),
-    )
-    return success_response(data.model_dump())
+    data = MetricsService(db).get_trends(query_scope)
+    payload = [MetricsTokenItem(**item).model_dump() for item in data]
+    return success_response(payload)
 
 
-@router.get("/errors", response_model=APIResponse)
-def get_metrics_errors(
+@router.get("/skills", response_model=APIResponse)
+def get_metrics_skills(
+    scope: str | None = Query("self", description="self/all，all 仅管理员可用"),
     start_date: str | None = Query(None),
     end_date: str | None = Query(None),
     top_n: int = Query(10, ge=1, le=50),
+    user_id: str | None = Query(None, description="仅管理员可指定某用户"),
     db: Session = Depends(get_db),
-    _admin=Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ) -> APIResponse:
-    start, end = _parse_window(start_date, end_date)
-
-    rows = (
-        db.query(RequestLog.status_code, func.count(RequestLog.id).label("count"))
-        .filter(
-            RequestLog.created_at >= start,
-            RequestLog.created_at <= end,
-            RequestLog.status_code >= 400,
-        )
-        .group_by(RequestLog.status_code)
-        .order_by(func.count(RequestLog.id).desc())
-        .limit(top_n)
-        .all()
+    query_scope = _resolve_metrics_scope(
+        current_user=current_user,
+        requested_scope=scope,
+        requested_user_id=user_id,
+        start_date=start_date,
+        end_date=end_date,
     )
+    _audit_admin_all_scope_if_needed(db=db, current_user=current_user, scope=query_scope, endpoint="skills")
 
-    data = MetricsErrors(
-        top_errors=[MetricsErrorItem(code=row.status_code, count=row.count) for row in rows]
-    )
-    return success_response(data.model_dump())
-
-
-@router.get("/tokens", response_model=APIResponse)
-def get_metrics_tokens(
-    start_date: str | None = Query(None),
-    end_date: str | None = Query(None),
-    db: Session = Depends(get_db),
-    _admin=Depends(require_admin),
-) -> APIResponse:
-    start, end = _parse_window(start_date, end_date)
-
-    day_col = func.date_trunc("day", LLMUsage.created_at)
-    rows = (
-        db.query(
-            day_col.label("d"),
-            func.coalesce(func.sum(LLMUsage.total_tokens), 0).label("tokens"),
-            func.coalesce(func.sum(LLMUsage.cost), 0).label("cost"),
-        )
-        .filter(LLMUsage.created_at >= start, LLMUsage.created_at <= end)
-        .group_by(day_col)
-        .order_by(day_col)
-        .all()
-    )
-
-    data = [
-        MetricsTokenItem(
-            date=row.d.date().isoformat(),
-            tokens=int(row.tokens or 0),
-            cost=float(row.cost or 0),
-        ).model_dump()
-        for row in rows
-    ]
-    return success_response(data)
+    data = MetricsService(db).get_skills(query_scope, top_n=top_n)
+    payload = MetricsErrors(**data).model_dump()
+    return success_response(payload)
 
 
 @router.get("/agents", response_model=APIResponse)
 def get_metrics_agents(
+    scope: str | None = Query("self", description="self/all，all 仅管理员可用"),
     start_date: str | None = Query(None),
     end_date: str | None = Query(None),
+    user_id: str | None = Query(None, description="仅管理员可指定某用户"),
     db: Session = Depends(get_db),
-    _admin=Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ) -> APIResponse:
-    start, end = _parse_window(start_date, end_date)
-
-    created = (
-        db.query(func.count(Agent.id))
-        .filter(Agent.created_at >= start, Agent.created_at <= end)
-        .scalar()
-        or 0
+    query_scope = _resolve_metrics_scope(
+        current_user=current_user,
+        requested_scope=scope,
+        requested_user_id=user_id,
+        start_date=start_date,
+        end_date=end_date,
     )
+    _audit_admin_all_scope_if_needed(db=db, current_user=current_user, scope=query_scope, endpoint="agents")
 
-    used = (
-        db.query(func.count(distinct(EventLog.user_id)))
-        .filter(
-            EventLog.created_at >= start,
-            EventLog.created_at <= end,
-            EventLog.event_type == "agent_use",
-        )
-        .scalar()
-        or 0
-    )
+    data = MetricsService(db).get_agents(query_scope)
+    payload = MetricsAgents(**data).model_dump()
+    return success_response(payload)
 
-    first_window_start = start
-    first_window_end = start + timedelta(days=7)
-    retention_window_end = first_window_end + timedelta(days=7)
 
-    first_week_users_subq = (
-        db.query(EventLog.user_id.label("uid"))
-        .filter(
-            EventLog.event_type == "agent_use",
-            EventLog.user_id.isnot(None),
-            EventLog.created_at >= first_window_start,
-            EventLog.created_at < first_window_end,
-        )
-        .group_by(EventLog.user_id)
-        .subquery()
-    )
+# backward-compatible aliases
+@router.get("/summary", response_model=APIResponse)
+def get_metrics_summary_alias(
+    scope: str | None = Query("self"),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> APIResponse:
+    return get_metrics_overview(scope, start_date, end_date, user_id, db, current_user)
 
-    retained_users = (
-        db.query(func.count(distinct(EventLog.user_id)))
-        .filter(
-            EventLog.event_type == "agent_use",
-            EventLog.user_id.in_(db.query(first_week_users_subq.c.uid)),
-            EventLog.created_at >= first_window_end,
-            EventLog.created_at < retention_window_end,
-        )
-        .scalar()
-        or 0
-    )
 
-    first_week_users = db.query(func.count(first_week_users_subq.c.uid)).scalar() or 0
-    retention_7d = float(retained_users / first_week_users) if first_week_users else 0.0
+@router.get("/tokens", response_model=APIResponse)
+def get_metrics_tokens_alias(
+    scope: str | None = Query("self"),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> APIResponse:
+    return get_metrics_trends(scope, start_date, end_date, user_id, db, current_user)
 
-    data = MetricsAgents(created=int(created), used=int(used), retention_7d=retention_7d)
-    return success_response(data.model_dump())
+
+@router.get("/errors", response_model=APIResponse)
+def get_metrics_errors_alias(
+    scope: str | None = Query("self"),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    top_n: int = Query(10, ge=1, le=50),
+    user_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> APIResponse:
+    return get_metrics_skills(scope, start_date, end_date, top_n, user_id, db, current_user)

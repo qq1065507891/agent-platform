@@ -61,7 +61,7 @@ def upgrade() -> None:
         sa.Column("owner_id", sa.String(length=36), nullable=False),
         sa.Column("prompt_template", sa.Text(), nullable=False),
         sa.Column("skills", sa.JSON(), nullable=False, server_default="[]"),
-        sa.Column("is_public", sa.Boolean(), nullable=False, server_default=sa.text("0")),
+        sa.Column("is_public", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),

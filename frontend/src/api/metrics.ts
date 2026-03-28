@@ -3,6 +3,8 @@ import request from '../utils/request'
 export interface MetricsRangeParams {
   start_date?: string
   end_date?: string
+  scope?: 'self' | 'all'
+  user_id?: string
 }
 
 export interface MetricsSummary {
@@ -33,14 +35,19 @@ export interface MetricsAgents {
   retention_7d: number
 }
 
-export const getMetricsSummary = (params?: MetricsRangeParams) =>
-  request.get<MetricsSummary>('/metrics/summary', { params })
+export const getMetricsOverview = (params?: MetricsRangeParams) =>
+  request.get<MetricsSummary>('/metrics/overview', { params })
 
-export const getMetricsErrors = (params?: MetricsRangeParams & { top_n?: number }) =>
-  request.get<MetricsErrors>('/metrics/errors', { params })
+export const getMetricsSkills = (params?: MetricsRangeParams & { top_n?: number }) =>
+  request.get<MetricsErrors>('/metrics/skills', { params })
 
-export const getMetricsTokens = (params?: MetricsRangeParams) =>
-  request.get<MetricsTokenItem[]>('/metrics/tokens', { params })
+export const getMetricsTrends = (params?: MetricsRangeParams) =>
+  request.get<MetricsTokenItem[]>('/metrics/trends', { params })
 
 export const getMetricsAgents = (params?: MetricsRangeParams) =>
   request.get<MetricsAgents>('/metrics/agents', { params })
+
+// backward compatibility names
+export const getMetricsSummary = getMetricsOverview
+export const getMetricsErrors = getMetricsSkills
+export const getMetricsTokens = getMetricsTrends
